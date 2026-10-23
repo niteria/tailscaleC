@@ -1,0 +1,8 @@
+/build*/
+/examples/esp32/build/
+/examples/esp32/sdkconfig
+/examples/esp32/sdkconfig.old
+/examples/esp32/managed_components/
+/examples/esp32/dependencies.lock
+__pycache__/
+*.py[cod]

@@ -1,0 +1,7 @@
+{
+  "acls": [
+    {"action": "accept", "src": ["*"], "dst": ["*:32123"], "proto": "udp"},
+    {"action": "accept", "src": ["*"], "dst": ["*:32123"], "proto": "tcp"},
+    {"action": "accept", "src": ["*"], "dst": ["100.64.0.1:16000-32122", "100.64.0.1:32125-65535"], "proto": "udp"}
+  ]
+}

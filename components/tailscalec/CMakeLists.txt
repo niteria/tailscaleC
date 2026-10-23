@@ -1,0 +1,27 @@
+get_filename_component(TSC_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+if(CMAKE_BUILD_EARLY_EXPANSION)
+    idf_component_register(PRIV_REQUIRES lwip esp_timer esp_hw_support mbedtls)
+    return()
+endif()
+include("${TSC_ROOT}/cmake/features.cmake")
+tsc_read_features(TSC)
+include("${TSC_ROOT}/cmake/library.cmake")
+tsc_collect_sources(TSC_SOURCES TSC_PRIVATE_INCLUDES)
+list(APPEND TSC_SOURCES "${TSC_ROOT}/platform/esp32/system.c")
+if(TSC_CLIENT OR TSC_DISCO OR TSC_DERP OR TSC_TLS)
+    list(APPEND TSC_SOURCES "${TSC_ROOT}/platform/esp32/crypto.c")
+endif()
+if(TSC_CLIENT OR TSC_TLS)
+    list(APPEND TSC_SOURCES "${TSC_ROOT}/platform/esp32/stream.c")
+endif()
+idf_component_register(
+    SRCS ${TSC_SOURCES}
+    INCLUDE_DIRS "${TSC_ROOT}/include"
+    PRIV_INCLUDE_DIRS ${TSC_PRIVATE_INCLUDES}
+    PRIV_REQUIRES lwip esp_timer esp_hw_support mbedtls)
+include("${TSC_ROOT}/cmake/config.cmake")
+tsc_configure_target(${COMPONENT_LIB})
+if(TSC_APP_TCP)
+    include("${TSC_ROOT}/src/tcp/tcp.cmake")
+    tsc_add_tcp(${COMPONENT_LIB})
+endif()

@@ -1,0 +1,14 @@
+# Headscale requires a nonempty DERP map even for a direct-only LAN test.
+# This STUN-only placeholder performs no external connections.
+regions:
+  999:
+    regionid: 999
+    regioncode: lab
+    regionname: Direct UDP Lab
+    nodes:
+      - name: lab-stun
+        regionid: 999
+        hostname: 127.0.0.1
+        ipv4: 127.0.0.1
+        stunport: 3478
+        stunonly: true

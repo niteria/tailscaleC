@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../../components")
+set(TSC_CONFIG_HEADER "${CMAKE_CURRENT_LIST_DIR}/config.h" CACHE FILEPATH "")
+set(PROJECT_VER "0.1.0")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(tailscalec_tailnet)

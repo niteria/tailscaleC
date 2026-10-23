@@ -1,0 +1,31 @@
+function(tsc_collect_sources output_sources output_includes)
+    get_filename_component(root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
+    set(sources "${root}/src/tsc.c" "${root}/platform/socket.c")
+    set(includes "${root}/platform")
+    if(TSC_STUN)
+        list(APPEND sources "${root}/src/stun.c")
+    endif()
+    if(TSC_CLIENT)
+        list(APPEND sources "${root}/src/client.c" "${root}/src/packet.c"
+            "${root}/src/policy.c")
+        file(GLOB control CONFIGURE_DEPENDS "${root}/src/control/*.c")
+        file(GLOB wireguard CONFIGURE_DEPENDS "${root}/src/wireguard/*.c")
+        list(APPEND sources ${control} ${wireguard}
+            "${root}/third_party/wireguard/crypto/refc/blake2s.c"
+            "${root}/third_party/wireguard/crypto/refc/chacha20.c")
+        list(APPEND includes "${root}/src/control" "${root}/src/wireguard"
+            "${root}/third_party/wireguard"
+            "${root}/third_party/wireguard/crypto/refc")
+    endif()
+    if(TSC_DISCO OR TSC_DERP)
+        list(APPEND sources "${root}/src/discovery/nacl_box.c")
+    endif()
+    if(TSC_DISCO)
+        list(APPEND sources "${root}/src/discovery/disco.c")
+    endif()
+    if(TSC_DERP)
+        list(APPEND sources "${root}/src/derp/derp.c")
+    endif()
+    set(${output_sources} ${sources} PARENT_SCOPE)
+    set(${output_includes} ${includes} PARENT_SCOPE)
+endfunction()
