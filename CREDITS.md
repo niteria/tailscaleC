@@ -22,13 +22,20 @@ including the portable mbedTLS provider, native lwIP integration support,
 bounded coordination memory, compact peer directory and authenticated session
 cache.
 
-Subsequent original contributions are licensed under the [MIT license](LICENSE).
-The received snapshot already included that license; Eryk's original
-contribution has the public-domain provenance described above.
+## CC0 dedication
+
+At Eryk's request, the project's original code, including the original version
+and subsequent original contributions, is dedicated to the public domain under
+[CC0 1.0 Universal](LICENSE). It is intended to be freely embedded, modified
+and redistributed.
+
+The credit above records the project's provenance; CC0 imposes no attribution
+requirement on the code it covers. The received snapshot included an MIT notice,
+while the current project-level dedication is CC0.
 
 ## Third-party components
 
 Bundled and adapted third-party code has its own licenses and copyright
 notices, documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the
-corresponding source files. The public-domain handover of Eryk's original
-contribution does not replace those third-party licenses.
+corresponding source files. The CC0 dedication covers project-original code;
+third-party components remain subject to their respective licenses.

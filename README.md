@@ -325,7 +325,12 @@ See [architecture](docs/architecture.md),
 test boundaries. Automated tests and bounded fuzz campaigns do not replace a
 security audit.
 
-Eryk's original contribution was supplied as public domain; see
-[credits and provenance](CREDITS.md). Subsequent original contributions are
-[MIT licensed](LICENSE). Vendored code and derived protocol components retain
-their upstream notices; see [third-party notices](THIRD_PARTY_NOTICES.md).
+## License
+
+At Eryk's request, project-original code and subsequent original contributions
+are dedicated to the public domain under [CC0 1.0 Universal](LICENSE), for free
+embedding, modification and redistribution. See
+[credits and provenance](CREDITS.md).
+
+Bundled and adapted third-party components retain their own licenses and
+notices; see [third-party notices](THIRD_PARTY_NOTICES.md).

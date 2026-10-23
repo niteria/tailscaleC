@@ -1,14 +1,14 @@
 # Third-party notices
 
-Eryk Wieliczko supplied the original version as public domain; see
-[credits and provenance](CREDITS.md). Subsequent original contributions are
-MIT licensed; see `LICENSE`. Bundled and derived code retains the applicable
-upstream license and copyright notices.
+Project-original code and subsequent original contributions are dedicated to
+the public domain under [CC0 1.0 Universal](LICENSE), at Eryk Wieliczko's request;
+see [credits and provenance](CREDITS.md). Bundled and derived third-party code
+retains the applicable upstream license and copyright notices.
 
 | Component | Origin | License / location |
 | --- | --- | --- |
 | WireGuard protocol and BLAKE2s/HChaCha20 helpers | wireguard-lwIP, via TailTiny | BSD-3-Clause; `third_party/wireguard/LICENSE` and source notices |
-| Noise/control transport adaptations | MicroLink / TailTiny | MIT; complete notice in `src/control/noise.c` |
+| Noise/HTTP2 control transport adaptations | MicroLink / TailTiny | MIT; complete notices in `src/control/noise.c` and `src/control/h2.c` |
 | NaCl box implementation | MicroLink / TailTiny, with source-level primitive notices | MIT and retained source notices; `src/discovery/LICENSE.tailtiny` |
 | Optional application TCP stack | lwIP 2.2.1 | BSD-3-Clause; `src/tcp/lwip/LICENSE` and per-file notices |
 
