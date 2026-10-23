@@ -19,6 +19,10 @@ The original version was provided by **Eryk Wieliczko
 See [credits and provenance](CREDITS.md) for the source import and subsequent
 development.
 
+<eryk>
+  Let's not overstate things - my portion of this code was just vibed with like 5 prompts and never really tested in practice. The truly "correct" way is to point your clanker into this repo and say "add Tailscale to my program/firmware/whatever" and test with the final program/device. That's what I'm doing to my own IoT around the house.
+</eryk>
+
 ## Configure the library
 
 Select a header when configuring CMake, or edit [`config.h`](config.h):
