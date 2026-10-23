@@ -603,6 +603,8 @@ struct tsc_wg_peer *tsc_wgi_process_initiation_message(struct tsc_wg *device, st
 			tsc_wgi_mix_hash(hash, msg->enc_static, sizeof(msg->enc_static));
 
 			peer = tsc_wgi_peer_lookup_by_pubkey(device, s);
+			if (!peer && device->resolve_peer)
+				peer = device->resolve_peer(device->hooks.user, device, s);
 			if (peer) {
 				handshake = &peer->handshake;
 
@@ -1028,4 +1030,3 @@ void tsc_wgi_encrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, st
 bool tsc_wgi_decrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, uint64_t counter, struct tsc_wg_keypair *keypair) {
 	return tsc_wgi_aead_decrypt(dst, src, src_len, NULL, 0, counter, keypair->receiving_key);
 }
-

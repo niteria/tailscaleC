@@ -229,8 +229,8 @@ int tsc_noise_send(tsc_noise *noise, const void *data, size_t length)
     if (!noise->ready || noise->failed) return TSC_ERR_IO;
     while (length) {
         uint8_t nonce[12];
-        size_t chunk = length > TSC_NOISE_PLAINTEXT_SIZE ?
-                           TSC_NOISE_PLAINTEXT_SIZE : length;
+        size_t chunk = length > sizeof(noise->tx_buffer) - 19 ?
+                           sizeof(noise->tx_buffer) - 19 : length;
         int result;
         if (noise->tx_nonce == UINT64_MAX) return fail(noise, TSC_ERR_PROTOCOL);
         make_nonce(nonce, noise->tx_nonce++);

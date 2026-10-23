@@ -1,7 +1,9 @@
 # Third-party notices
 
-The project's original code is MIT licensed; see `LICENSE`. Bundled and derived
-code retains the applicable upstream license and copyright notices.
+Eryk Wieliczko supplied the original version as public domain; see
+[credits and provenance](CREDITS.md). Subsequent original contributions are
+MIT licensed; see `LICENSE`. Bundled and derived code retains the applicable
+upstream license and copyright notices.
 
 | Component | Origin | License / location |
 | --- | --- | --- |
@@ -14,9 +16,11 @@ The selected lwIP sources are namespaced to coexist with ESP-IDF's separate
 network stack. `src/tcp/vendor.py` records the upstream revision and reproduces
 the import; `src/tcp/README.md` describes the modifications.
 
-POSIX builds use the system OpenSSL provider when crypto/TLS is enabled; its
-license is supplied with that dependency. ESP32 builds use ESP-IDF's mbedTLS
-provider and other SDK components, whose licenses remain with the SDK.
+POSIX builds use the system OpenSSL provider by default when crypto/TLS is
+enabled; its license is supplied with that dependency. The portable mbedTLS
+provider uses an application-supplied mbedTLS dependency with its own license.
+ESP32 builds use ESP-IDF's mbedTLS provider and other SDK components, whose
+licenses remain with the SDK.
 
 Optional integration tests download pinned upstream Go WireGuard/Tailscale and
 Headscale test dependencies. Their modules and images retain their own licenses;

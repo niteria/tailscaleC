@@ -42,6 +42,7 @@ typedef struct {
   const tsc_endpoint *endpoints;
   size_t endpoint_count;
   uint16_t preferred_derp; /* Home relay region, 0 when no relay is connected. */
+  const uint8_t *endpoint_types; /* Optional tailcfg types, default Local (1). */
 } tsc_control_config;
 
 #if TSC_ENABLE_DERP
@@ -68,10 +69,28 @@ typedef struct {
 #endif
 #endif
 
+#if TSC_CONTROL_COMPACT_PEERS
+typedef struct { uint8_t address[4]; uint16_t port; } tsc_control_endpoint;
+static inline tsc_endpoint tsc_control_endpoint_load(const tsc_control_endpoint *p) {
+  tsc_endpoint out = {0};
+  out.family = TSC_AF_IPV4; out.port = p->port;
+  for (unsigned i = 0; i < 4; ++i) out.address[i] = p->address[i];
+  return out;
+}
+static inline void tsc_control_endpoint_store(tsc_control_endpoint *p, const tsc_endpoint *in) {
+  p->port = in->port;
+  for (unsigned i = 0; i < 4; ++i) p->address[i] = in->address[i];
+}
+#else
+typedef tsc_endpoint tsc_control_endpoint;
+static inline tsc_endpoint tsc_control_endpoint_load(const tsc_control_endpoint *p) { return *p; }
+static inline void tsc_control_endpoint_store(tsc_control_endpoint *p, const tsc_endpoint *in) { *p = *in; }
+#endif
+
 typedef struct {
   uint64_t id;
   /* Monotonic deadline anchored to authenticated coordinator time. */
-  uint64_t expires_at_ms;
+  union { uint64_t expires_at_ms; int64_t staging_expiry_unix_ms; };
   unsigned has_expiry;
   uint8_t public_key[32];
   uint8_t disco_key[32];
@@ -79,10 +98,11 @@ typedef struct {
   uint8_t ipv6[16];
   unsigned has_ipv4;
   unsigned has_ipv6;
-  tsc_endpoint endpoints[TSC_CONTROL_MAX_ENDPOINTS];
+  unsigned online;
+  tsc_control_endpoint endpoints[TSC_CONTROL_MAX_ENDPOINTS];
   size_t endpoint_count;
   uint16_t home_derp;
-  char name[128];
+  char name[TSC_CONTROL_PEER_NAME_SIZE];
 } tsc_control_peer;
 
 typedef struct {
@@ -94,7 +114,12 @@ typedef struct {
   uint64_t expires_at_ms;
   unsigned has_expiry;
   tsc_policy policy;
+#if TSC_CONTROL_DYNAMIC_PEERS
+  tsc_control_peer *peers;
+  size_t peer_capacity;
+#else
   tsc_control_peer peers[TSC_MAX_PEERS];
+#endif
   size_t peer_count;
   uint64_t generation;
   uint16_t home_derp;
@@ -126,12 +151,17 @@ int tsc_control_expire(tsc_control *control);
  * max_age_ms must be nonzero and platform.monotonic_ms must be available. */
 int tsc_control_maintain(tsc_control *control, uint32_t max_age_ms);
 int tsc_control_set_endpoints(tsc_control *control,
-                              const tsc_endpoint *endpoints, size_t count);
+                               const tsc_endpoint *endpoints, size_t count);
+int tsc_control_set_endpoints_typed(tsc_control *control,
+    const tsc_endpoint *endpoints, const uint8_t *types, size_t count);
 const tsc_control_map *tsc_control_get_map(const tsc_control *control);
 const char *tsc_control_last_error(const tsc_control *control);
 void tsc_control_close(tsc_control *control);
 /* Fixed context allocation, excluding platform TCP/TLS/crypto provider heap. */
 size_t tsc_control_memory_size(void);
+/* Additional temporary allocation during join/map refresh, zero when the
+ * configured fixed context already contains this storage. */
+size_t tsc_control_scratch_size(void);
 
 #ifdef __cplusplus
 }

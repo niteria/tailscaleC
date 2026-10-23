@@ -66,6 +66,9 @@ typedef struct {
  * in every build; IPv6 entries never match when TSC_ENABLE_IPV6 is disabled.
  * json must not overlap policy. */
 int tsc_policy_parse_json(tsc_policy *policy, const uint8_t *json, size_t length);
+/* Append a complete rule array (or null) to a validated policy without a second
+ * policy-sized scratch buffer. Any error clears the ENTIRE policy. */
+int tsc_policy_append_json(tsc_policy *policy, const uint8_t *json, size_t length);
 
 /* Stateless inbound allow-rule check. src/dst are network-order bytes (4 or
  * 16). Pass host-order destination port for TCP/UDP/SCTP. ICMP has no port;

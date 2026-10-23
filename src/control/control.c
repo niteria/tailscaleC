@@ -6,6 +6,7 @@
 #include "control_time.h"
 #include "json.h"
 #include "protocol.h"
+#include "project.h"
 #include "tailscalec/crypto.h"
 #include "tailscalec/stream.h"
 #include <limits.h>
@@ -17,6 +18,21 @@
 #define TSC_CONTROL_VERSION 131
 #define REQUEST_SIZE 4096
 
+#if TSC_CONTROL_DYNAMIC_SCRATCH
+typedef struct {
+  union { char request[REQUEST_SIZE]; char response[TSC_CONTROL_RESPONSE_SIZE + 1]; };
+  tsc_json_token tokens[TSC_CONTROL_JSON_TOKENS];
+} control_scratch;
+#endif
+
+#if TSC_CONTROL_DYNAMIC_PEERS
+typedef struct {
+  tsc_control_peer *data;
+  size_t count, capacity;
+  int error;
+} peer_batch;
+#endif
+
 typedef struct {
   tsc_control_config config;
   char host[256], authority[288];
@@ -26,18 +42,68 @@ typedef struct {
   tsc_noise noise;
   tsc_h2 h2;
   tsc_endpoint endpoints[TSC_CONTROL_MAX_ENDPOINTS];
+  uint8_t endpoint_types[TSC_CONTROL_MAX_ENDPOINTS];
   size_t endpoint_count;
   uint8_t node_public[32];
+#if TSC_CONTROL_SINGLE_MAP
+  /* Calls are serialized; refresh already fails closed on any error. Reuse
+   * the old map while traffic is disabled instead of retaining two copies. */
+  union { tsc_control_map map, next_map; };
+#else
   tsc_control_map map, next_map;
+#endif
   char error[160];
-  char request[REQUEST_SIZE];
-  char response[TSC_CONTROL_RESPONSE_SIZE + 1];
+#if TSC_CONTROL_DYNAMIC_SCRATCH
+  control_scratch *scratch;
+  char *request, *response;
+  tsc_json_token *tokens;
+#else
+  /* HTTP/2 sends the entire request before receiving the response. */
+  union {
+    char request[REQUEST_SIZE];
+    char response[TSC_CONTROL_RESPONSE_SIZE + 1];
+  };
   tsc_json_token tokens[TSC_CONTROL_JSON_TOKENS];
+#endif
   size_t token_count;
   uint64_t request_started_ms, last_map_ms, last_clock_ms;
   unsigned request_has_clock, has_last_clock, map_has_control_time;
   int64_t map_control_time_ms;
+#if TSC_CONTROL_DYNAMIC_PEERS
+  peer_batch batches[2];
+  unsigned streaming_peers;
+  uint64_t stream_generation;
+#endif
 } control_impl;
+
+static int scratch_open(control_impl *c) {
+#if TSC_CONTROL_DYNAMIC_SCRATCH
+  if (!c->scratch) {
+    c->scratch = malloc(sizeof(*c->scratch));
+    if (!c->scratch) return TSC_ERR_SPACE;
+    c->request = c->scratch->request;
+    c->response = c->scratch->response;
+    c->tokens = c->scratch->tokens;
+  }
+#else
+  (void)c;
+#endif
+  return TSC_OK;
+}
+static void scratch_close(control_impl *c) {
+#if TSC_CONTROL_DYNAMIC_SCRATCH
+  if (c->scratch) {
+    tsc_crypto_zero(c->scratch, sizeof(*c->scratch));
+    free(c->scratch);
+    c->scratch = NULL;
+    c->request = c->response = NULL;
+    c->tokens = NULL;
+    c->token_count = 0;
+  }
+#else
+  (void)c;
+#endif
+}
 
 typedef struct {
   char *out;
@@ -260,10 +326,10 @@ static int read_server_key(control_impl *c, uint8_t server_key[32]) {
   if (r)
     return fail(c, r, "connecting to control server");
   int n = snprintf(
-      c->request, sizeof(c->request),
+      c->request, REQUEST_SIZE,
       "GET /key?v=%u HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
       TSC_CONTROL_VERSION, c->authority);
-  if (n < 0 || (size_t)n >= sizeof(c->request))
+  if (n < 0 || (size_t)n >= REQUEST_SIZE)
     r = TSC_ERR_SPACE;
   else
     r = write_all(c, c->request, (size_t)n);
@@ -333,12 +399,12 @@ static int upgrade(control_impl *c, const uint8_t server_key[32]) {
     return fail(c, r, "creating Noise handshake");
   base64(initiation, sizeof(initiation), encoded);
   int n = snprintf(
-      c->request, sizeof(c->request),
+      c->request, REQUEST_SIZE,
       "POST /ts2021 HTTP/1.1\r\nHost: %s\r\nUpgrade: "
       "tailscale-control-protocol\r\nConnection: Upgrade\r\nUser-Agent: "
       "tailscalec\r\nX-Tailscale-Handshake: %s\r\nContent-Length: 0\r\n\r\n",
       c->authority, encoded);
-  if (n < 0 || (size_t)n >= sizeof(c->request))
+  if (n < 0 || (size_t)n >= REQUEST_SIZE)
     return fail(c, TSC_ERR_SPACE, "upgrade request too large");
   r = write_all(c, c->request, (size_t)n);
   unsigned status = 0;
@@ -380,7 +446,7 @@ static int post(control_impl *c, const char *path, size_t request_length,
   return TSC_OK;
 }
 static int register_node(control_impl *c) {
-  writer w = {c->request, sizeof(c->request), 0, 0};
+  writer w = {c->request, REQUEST_SIZE, 0, 0};
   c->request[0] = 0;
   char key[65];
   hexkey(c->node_public, key);
@@ -488,9 +554,22 @@ static int parse_addresses(control_impl *c, const char *json, size_t node,
   }
   return peer->has_ipv4 || peer->has_ipv6 ? TSC_OK : TSC_ERR_PROTOCOL;
 }
+#if TSC_CONTROL_COMPACT_PEERS
+static unsigned endpoint_rank(control_impl *c, const tsc_endpoint *ep) {
+  const uint8_t *a = ep->address;
+  if (a[0] == 127 || !a[0] || a[0] >= 224 || (a[0] == 169 && a[1] == 254)) return 0;
+  int private_ip = a[0] == 10 || (a[0] == 172 && a[1] >= 16 && a[1] < 32) ||
+                   (a[0] == 192 && a[1] == 168) || (a[0] == 100 && a[1] >= 64 && a[1] < 128);
+  if (!private_ip) return 3;
+  for (size_t i = 0; i < c->endpoint_count; ++i)
+    if (c->endpoints[i].family == TSC_AF_IPV4 && !memcmp(c->endpoints[i].address, a, 3)) return 4;
+  return 1;
+}
+#endif
 static int parse_node(control_impl *c, const char *json, size_t index,
-                      tsc_control_peer *peer) {
+                       tsc_control_peer *peer) {
   memset(peer, 0, sizeof(*peer));
+  peer->online = 1; /* Missing status is a hint of unknown, never a denial. */
   if (c->tokens[index].type != TSC_JSON_OBJECT)
     return TSC_ERR_PROTOCOL;
   size_t item;
@@ -501,6 +580,12 @@ static int parse_node(control_impl *c, const char *json, size_t index,
     return TSC_ERR_PROTOCOL;
   peer->id = (uint64_t)value;
   char text[160];
+  if (member(c, json, index, "Online", &item) == TSC_OK &&
+      c->tokens[item].type != TSC_JSON_NULL) {
+    int online;
+    if (tsc_json_bool(json, &c->tokens[item], &online)) return TSC_ERR_PROTOCOL;
+    peer->online = (unsigned)online;
+  }
   r = member(c, json, index, "Key", &item);
   if (r)
     return TSC_ERR_PROTOCOL;
@@ -520,7 +605,7 @@ static int parse_node(control_impl *c, const char *json, size_t index,
         return r;
     }
   }
-  if (member(c, json, index, "Name", &item) == TSC_OK) {
+  if (TSC_CONTROL_PEER_NAME_SIZE > 1 && member(c, json, index, "Name", &item) == TSC_OK) {
     r = string(c, json, item, peer->name, sizeof(peer->name));
     if (r)
       return r;
@@ -566,14 +651,33 @@ static int parse_node(control_impl *c, const char *json, size_t index,
         continue;
 #endif
       int duplicate = 0;
-      for (size_t j = 0; j < peer->endpoint_count; j++)
-        if (tsc_endpoint_equal(&endpoint, &peer->endpoints[j]))
+      for (size_t j = 0; j < peer->endpoint_count; j++) {
+        tsc_endpoint previous = tsc_control_endpoint_load(&peer->endpoints[j]);
+        if (tsc_endpoint_equal(&endpoint, &previous))
           duplicate = 1;
+      }
       if (duplicate)
         continue;
-      if (peer->endpoint_count >= TSC_CONTROL_MAX_ENDPOINTS)
+      if (peer->endpoint_count >= TSC_CONTROL_MAX_ENDPOINTS) {
+#if TSC_CONTROL_COMPACT_PEERS
+        /* Candidate addresses are reachability hints, not authorization.
+         * Keep a bounded set, preferring public/same-LAN paths over extra
+         * bridges and virtual interfaces on larger machines. */
+        size_t least = 0;
+        unsigned rank = UINT_MAX;
+        for (size_t j = 0; j < peer->endpoint_count; ++j) {
+          tsc_endpoint candidate = tsc_control_endpoint_load(&peer->endpoints[j]);
+          unsigned score = endpoint_rank(c, &candidate);
+          if (score <= rank) { rank = score; least = j; }
+        }
+        if (endpoint_rank(c, &endpoint) > rank)
+          tsc_control_endpoint_store(&peer->endpoints[least], &endpoint);
+        continue;
+#else
         return TSC_ERR_SPACE;
-      peer->endpoints[peer->endpoint_count++] = endpoint;
+#endif
+      }
+      tsc_control_endpoint_store(&peer->endpoints[peer->endpoint_count++], &endpoint);
     }
   }
   return TSC_OK;
@@ -627,21 +731,11 @@ static int parse_policy(control_impl *c, const char *json) {
       return r;
     if (strcmp(name, "*") && strcmp(name, "base") &&
         c->tokens[value].type != TSC_JSON_NULL) {
-      /* Reuse current map's policy as a temporary during a transaction;
-       * on any error fail() disables the whole map. */
-      tsc_policy *temporary = &c->map.policy;
-      r = tsc_policy_parse_json(temporary,
+      r = tsc_policy_append_json(policy,
                                 (const uint8_t *)json + c->tokens[value].start,
                                 c->tokens[value].end - c->tokens[value].start);
       if (r)
         return r;
-      if ((size_t)policy->rule_count + temporary->rule_count >
-          TSC_MAX_FILTER_RULES)
-        return TSC_ERR_SPACE;
-      memcpy(policy->rules + policy->rule_count, temporary->rules,
-             (size_t)temporary->rule_count * sizeof(temporary->rules[0]));
-      policy->rule_count =
-          (uint16_t)(policy->rule_count + temporary->rule_count);
     }
     k = c->tokens[value].next;
   }
@@ -780,13 +874,126 @@ static int parse_derp_map(control_impl *c, const char *json) {
 }
 #endif
 
+#if TSC_CONTROL_DYNAMIC_PEERS
+static void stream_cleanup(control_impl *c) {
+  for (unsigned i = 0; i < 2; ++i) {
+    free(c->batches[i].data);
+    memset(&c->batches[i], 0, sizeof(c->batches[i]));
+  }
+  c->streaming_peers = 0;
+}
+static void map_storage_clear(control_impl *c) {
+  free(c->map.peers);
+  c->map.peers = NULL;
+  c->map.peer_count = c->map.peer_capacity = 0;
+  stream_cleanup(c);
+}
+static void stream_begin(control_impl *c) {
+  uint64_t generation = c->map.generation;
+  map_storage_clear(c);
+  memset(&c->map, 0, sizeof(c->map));
+  c->map_valid = 0;
+  c->stream_generation = generation;
+  c->streaming_peers = 1;
+}
+static int stream_node(control_impl *c, peer_batch *batch, const char *json) {
+  size_t item;
+  int value;
+  if (!member(c, json, 0, "Expired", &item)) {
+    if (tsc_json_bool(json, &c->tokens[item], &value)) return TSC_ERR_PROTOCOL;
+    if (value) return TSC_OK;
+  }
+  if (!member(c, json, 0, "MachineAuthorized", &item)) {
+    if (tsc_json_bool(json, &c->tokens[item], &value)) return TSC_ERR_PROTOCOL;
+    if (!value) return TSC_OK;
+  }
+  tsc_control_peer peer;
+  int r = parse_node(c, json, 0, &peer);
+  if (r) return r;
+  r = member(c, json, 0, "KeyExpiry", &item);
+  if (!r && c->tokens[item].type != TSC_JSON_NULL) {
+    char text[64]; int64_t epoch; unsigned remainder, zero;
+    r = string(c, json, item, text, sizeof(text));
+    if (r) return r;
+    r = tsc_control_time_parse(text, &epoch, &remainder, &zero);
+    if (r) return r;
+    if (!zero) { peer.has_expiry = 1; peer.staging_expiry_unix_ms = epoch; }
+  } else if (r != TSC_OK && r != TSC_AGAIN) return r;
+  if (batch->count == TSC_MAX_PEERS) return TSC_ERR_SPACE;
+  if (batch->count == batch->capacity) {
+    size_t capacity = batch->capacity + 8;
+    if (capacity > TSC_MAX_PEERS) capacity = TSC_MAX_PEERS;
+    tsc_control_peer *data = realloc(batch->data, capacity * sizeof(*data));
+    if (!data) return TSC_ERR_SPACE;
+    batch->data = data; batch->capacity = capacity;
+  }
+  batch->data[batch->count++] = peer;
+  return TSC_OK;
+}
+static int projected_peer(void *user, const char *json, size_t length, unsigned source) {
+  control_impl *c = user;
+  if (source < 1 || source > 2) return TSC_ERR_ARGUMENT;
+  peer_batch *batch = &c->batches[source - 1];
+  if (!batch->error) {
+    int r = parse(c, json, length);
+    batch->error = r ? r : stream_node(c, batch, json);
+  }
+  /* Errors are retained separately: Peers takes precedence over PeersChanged
+   * even when those fields arrive in the opposite order. */
+  return 0;
+}
+static int install_streamed_peers(control_impl *c, const char *json, uint64_t now) {
+  size_t item;
+  unsigned source = 0;
+  int r = member(c, json, 0, "Peers", &item);
+  if (r == TSC_AGAIN || (!r && c->tokens[item].type == TSC_JSON_NULL)) {
+    source = 1;
+    r = member(c, json, 0, "PeersChanged", &item);
+  }
+  if (r == TSC_AGAIN || (!r && c->tokens[item].type == TSC_JSON_NULL)) return TSC_OK;
+  if (r || c->tokens[item].type != TSC_JSON_ARRAY || c->tokens[item].next != item + 1)
+    return TSC_ERR_PROTOCOL; /* Non-object array elements were not streamed. */
+  peer_batch *batch = &c->batches[source];
+  if (batch->error) return batch->error;
+  c->next_map.peers = batch->data;
+  c->next_map.peer_capacity = batch->capacity;
+  batch->data = NULL;
+  for (size_t i = 0; i < batch->count; ++i) {
+    tsc_control_peer peer = c->next_map.peers[i];
+    if (peer.has_expiry) {
+      if (!c->map_has_control_time || !c->request_has_clock) return TSC_ERR_UNSUPPORTED;
+      int64_t epoch = peer.staging_expiry_unix_ms;
+      uint64_t deadline = c->request_started_ms;
+      if (epoch > c->map_control_time_ms) {
+        uint64_t delta = (uint64_t)(epoch - c->map_control_time_ms);
+        if (delta > UINT64_MAX - deadline) return TSC_ERR_PROTOCOL;
+        deadline += delta;
+      }
+      if (now >= deadline) continue;
+      peer.expires_at_ms = deadline;
+    }
+    c->next_map.peers[c->next_map.peer_count++] = peer;
+  }
+  return TSC_OK;
+}
+#endif
+
 static int parse_map(control_impl *c, const char *json, size_t length) {
+#if TSC_CONTROL_DYNAMIC_PEERS
+  uint64_t generation = c->stream_generation;
+  if (!c->streaming_peers) return fail(c, TSC_ERR_ARGUMENT, "peer stream not started");
+#else
+  uint64_t generation = c->map.generation;
+#endif
   int r = parse(c, json, length);
   if (r)
     return fail(c, r, "malformed map JSON or token capacity exceeded");
   if (c->tokens[0].type != TSC_JSON_OBJECT)
     return fail(c, TSC_ERR_PROTOCOL, "map is not an object");
+  c->map_valid = 0;
+#if !TSC_CONTROL_DYNAMIC_PEERS
   memset(&c->next_map, 0, sizeof(c->next_map));
+#endif
   r = map_time(c, json);
   if (r)
     return fail(c, r, "invalid authenticated coordinator time");
@@ -822,13 +1029,34 @@ static int parse_map(control_impl *c, const char *json, size_t length) {
   c->next_map.has_ipv6 = self.has_ipv6;
   c->next_map.node_id = self.id;
   c->next_map.home_derp = self.home_derp;
-  memcpy(c->next_map.name, self.name, sizeof(self.name));
+  if (!member(c, json, node, "Name", &item)) {
+    r = string(c, json, item, c->next_map.name, sizeof(c->next_map.name));
+    if (r) return fail(c, r, "invalid own node name");
+  }
   r = node_expiry(c, json, node, &c->next_map.has_expiry,
                   &c->next_map.expires_at_ms);
   if (r)
     return fail(c, r, "cannot safely determine local key expiry");
   if (c->next_map.has_expiry && now >= c->next_map.expires_at_ms)
     return fail(c, TSC_ERR_PROTOCOL, "local node key expired");
+#if TSC_CONTROL_DYNAMIC_PEERS
+  r = install_streamed_peers(c, json, now);
+  if (r) return fail(c, r, "invalid streamed peers or directory capacity exceeded");
+  for (size_t i = 0; i < c->next_map.peer_count; ++i) {
+    const tsc_control_peer *peer = &c->next_map.peers[i];
+    if (peer->id == self.id || tsc_crypto_equal(peer->public_key, self.public_key, 32) ||
+        (peer->has_ipv4 && self.has_ipv4 && !memcmp(peer->ipv4, self.ipv4, 4)) ||
+        (peer->has_ipv6 && self.has_ipv6 && !memcmp(peer->ipv6, self.ipv6, 16)))
+      return fail(c, TSC_ERR_PROTOCOL, "self identity or address listed as peer");
+    for (size_t j = 0; j < i; ++j) {
+      const tsc_control_peer *previous = &c->next_map.peers[j];
+      if (peer->id == previous->id || tsc_crypto_equal(peer->public_key, previous->public_key, 32) ||
+          (peer->has_ipv4 && previous->has_ipv4 && !memcmp(peer->ipv4, previous->ipv4, 4)) ||
+          (peer->has_ipv6 && previous->has_ipv6 && !memcmp(peer->ipv6, previous->ipv6, 16)))
+        return fail(c, TSC_ERR_PROTOCOL, "duplicate peer identity or address");
+    }
+  }
+#else
   r = member(c, json, 0, "Peers", &item);
   /* Each fetch starts a new map stream. Tailscale sends its initial complete
    * peer set as PeersChanged, while Headscale uses Peers. This is not a delta
@@ -891,6 +1119,7 @@ static int parse_map(control_impl *c, const char *json, size_t length) {
     }
   } else if (r != TSC_AGAIN && r != TSC_OK)
     return fail(c, r, "invalid peers field");
+#endif
 #if TSC_ENABLE_DERP
   r = parse_derp_map(c, json);
   if (r)
@@ -900,7 +1129,7 @@ static int parse_map(control_impl *c, const char *json, size_t length) {
   if (r)
     return fail(c, r,
                 "packet filter unsupported, malformed, or exceeds capacity");
-  c->next_map.generation = c->map.generation + 1;
+  c->next_map.generation = generation + 1;
   c->map = c->next_map;
   c->map_valid = 1;
   c->last_map_ms = c->request_started_ms;
@@ -909,7 +1138,7 @@ static int parse_map(control_impl *c, const char *json, size_t length) {
 }
 static int build_map_request(control_impl *c, int streaming,
                              size_t *request_length) {
-  writer w = {c->request, sizeof(c->request), 0, 0};
+  writer w = {c->request, REQUEST_SIZE, 0, 0};
   c->request[0] = 0;
   char key[65];
   hexkey(c->node_public, key);
@@ -935,7 +1164,8 @@ static int build_map_request(control_impl *c, int streaming,
   for (size_t i = 0; i < c->endpoint_count; i++) {
     if (i)
       put(&w, ",");
-    put(&w, "1");
+    char type[2] = {(char)('0' + c->endpoint_types[i]), 0};
+    put(&w, type);
   }
   put(&w, "],");
   hostinfo(&w, c);
@@ -961,6 +1191,32 @@ static int fetch_map(control_impl *c) {
     r = post(c, "/machine/map", request_length, &length, 0);
   if (!r)
     r = build_map_request(c, 1, &request_length);
+#if TSC_CONTROL_PROJECT_MAP
+  tsc_json_project projection;
+  tsc_json_project_init(&projection, c->response, TSC_CONTROL_RESPONSE_SIZE + 1);
+#if TSC_CONTROL_DYNAMIC_PEERS
+  stream_begin(c);
+  projection.peer_handler = projected_peer;
+  projection.peer_user = c;
+#endif
+  unsigned status = 0;
+  if (!r)
+    r = tsc_h2_post_map_stream(&c->h2, c->authority, "/machine/map", c->request,
+        request_length, 131072, tsc_json_project_feed, &projection, &status);
+  if (!r && status != 200) r = TSC_ERR_PROTOCOL;
+  if (!r) r = tsc_json_project_finish(&projection);
+  if (r) {
+#if TSC_CONTROL_DYNAMIC_PEERS
+    stream_cleanup(c);
+#endif
+    return fail(c, r, "streaming control transport/projection failed");
+  }
+  r = parse_map(c, c->response, projection.used);
+#if TSC_CONTROL_DYNAMIC_PEERS
+  stream_cleanup(c);
+#endif
+  return r;
+#else
   if (!r)
     r = post(c, "/machine/map", request_length, &length, 1);
   if (r)
@@ -974,6 +1230,7 @@ static int fetch_map(control_impl *c) {
   if (n != length - 4)
     return fail(c, TSC_ERR_PROTOCOL, "unexpected map response length");
   return parse_map(c, c->response + 4, n);
+#endif
 }
 int tsc_control_join(tsc_control *control, const tsc_control_config *config) {
   if (!control || !config || control->implementation ||
@@ -992,13 +1249,15 @@ int tsc_control_join(tsc_control *control, const tsc_control_config *config) {
   int r = url(c, config->url);
   if (r)
     return fail(c, r, "unsupported or invalid control URL");
-  r = tsc_control_set_endpoints(control, config->endpoints,
-                                config->endpoint_count);
+  r = tsc_control_set_endpoints_typed(control, config->endpoints,
+                                      config->endpoint_types, config->endpoint_count);
   if (r)
     return r;
   r = tsc_crypto_x25519_public(c->node_public, config->node_private_key);
   if (r)
     return fail(c, r, "invalid node private key");
+  r = scratch_open(c);
+  if (r) return fail(c, r, "control scratch allocation failed");
   uint8_t server_key[32];
   if (config->server_public_key) {
     memcpy(server_key, config->server_public_key, sizeof(server_key));
@@ -1013,6 +1272,7 @@ int tsc_control_join(tsc_control *control, const tsc_control_config *config) {
     r = register_node(c);
   if (!r)
     r = fetch_map(c);
+  scratch_close(c);
   if (r) {
     tsc_stream_close(&c->stream);
     tsc_noise_clear(&c->noise);
@@ -1027,7 +1287,10 @@ int tsc_control_poll(tsc_control *control) {
   control_impl *c = control->implementation;
   if (!c->connected)
     return fail(c, TSC_ERR_IO, "control is disconnected");
-  int r = fetch_map(c);
+  int r = scratch_open(c);
+  if (r) return fail(c, r, "control scratch allocation failed");
+  r = fetch_map(c);
+  scratch_close(c);
   if (r) {
     c->connected = 0;
     tsc_stream_close(&c->stream);
@@ -1092,12 +1355,17 @@ int tsc_control_maintain(tsc_control *control, uint32_t max_age_ms) {
   return tsc_control_poll(control);
 }
 int tsc_control_set_endpoints(tsc_control *control,
-                              const tsc_endpoint *endpoints, size_t count) {
+                               const tsc_endpoint *endpoints, size_t count) {
+  return tsc_control_set_endpoints_typed(control, endpoints, NULL, count);
+}
+int tsc_control_set_endpoints_typed(tsc_control *control,
+    const tsc_endpoint *endpoints, const uint8_t *types, size_t count) {
   if (!control || !control->implementation ||
       count > TSC_CONTROL_MAX_ENDPOINTS || (count && !endpoints))
     return TSC_ERR_ARGUMENT;
   control_impl *c = control->implementation;
   for (size_t i = 0; i < count; i++) {
+    if (types && types[i] > 5) return TSC_ERR_ARGUMENT;
     char buffer[100];
     int r = tsc_control_endpoint_format(&endpoints[i], buffer, sizeof(buffer));
     if (r)
@@ -1105,6 +1373,7 @@ int tsc_control_set_endpoints(tsc_control *control,
   }
   if (count)
     memcpy(c->endpoints, endpoints, count * sizeof(*endpoints));
+  for (size_t i = 0; i < count; ++i) c->endpoint_types[i] = types ? types[i] : 1;
   c->endpoint_count = count;
   return TSC_OK;
 }
@@ -1124,9 +1393,20 @@ void tsc_control_close(tsc_control *control) {
   control_impl *c = control->implementation;
   tsc_stream_close(&c->stream);
   tsc_noise_clear(&c->noise);
+  scratch_close(c);
+#if TSC_CONTROL_DYNAMIC_PEERS
+  map_storage_clear(c);
+#endif
   tsc_crypto_zero(c, sizeof(*c));
   free(c);
   control->implementation = NULL;
 }
 
 size_t tsc_control_memory_size(void) { return sizeof(control_impl); }
+size_t tsc_control_scratch_size(void) {
+#if TSC_CONTROL_DYNAMIC_SCRATCH
+  return sizeof(control_scratch);
+#else
+  return 0;
+#endif
+}

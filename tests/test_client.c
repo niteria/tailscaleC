@@ -4,9 +4,12 @@
 #include "check.h"
 #include <string.h>
 
-#if TSC_ENABLE_CLIENT && TSC_APP_UDP && TSC_MAX_UDP_PORTS >= 2
+#if TSC_ENABLE_CLIENT
 
 #define QUEUE_SIZE 64
+#ifndef TEST_NODES
+#define TEST_NODES 2
+#endif
 
 typedef struct {
     tsc_endpoint source;
@@ -26,12 +29,15 @@ typedef struct {
     uint64_t last_map;
 } adapter;
 
-struct network { adapter nodes[2]; uint64_t now; };
+struct network { adapter nodes[TEST_NODES]; uint64_t now; };
 static network net;
-static tsc_client clients[2];
-static tsc_identity identities[2];
+static tsc_client clients[TEST_NODES];
+static tsc_identity identities[TEST_NODES];
+static unsigned received[TEST_NODES];
+#if TSC_APP_UDP && TSC_MAX_UDP_PORTS >= 2
 static tsc_udp sockets[2], denied, unsolicited;
-static unsigned received[2], denied_received;
+static unsigned denied_received;
+#endif
 static const char payload[] = "secret-tailnet-message";
 
 /* A fake coordinator isolates packet routing and connection tracking tests.
@@ -96,6 +102,12 @@ int tsc_control_set_endpoints(tsc_control *control, const tsc_endpoint *endpoint
     (void)control; (void)endpoints; (void)count;
     return TSC_OK;
 }
+int tsc_control_set_endpoints_typed(tsc_control *control, const tsc_endpoint *endpoints,
+                                    const uint8_t *types, size_t count)
+{
+    (void)types;
+    return tsc_control_set_endpoints(control, endpoints, count);
+}
 
 static int send_packet(void *user, const tsc_endpoint *to,
                          const void *packet, size_t length)
@@ -107,7 +119,7 @@ static int send_packet(void *user, const tsc_endpoint *to,
         CHECK(memcmp((const uint8_t *)packet + offset, payload,
                        sizeof(payload) - 1) != 0);
     ++source->tx_count;
-    for (i = 0; i < 2; ++i) {
+    for (i = 0; i < TEST_NODES; ++i) {
         adapter *target = &source->network->nodes[i];
         queued_packet *slot;
         if (!tsc_endpoint_equal(to, &target->outer)) continue;
@@ -160,6 +172,7 @@ static int timestamp(void *user, uint8_t bytes[12])
     return TSC_OK;
 }
 
+#if TSC_APP_UDP && TSC_MAX_UDP_PORTS >= 2
 static void receive_udp(void *user, tsc_udp *socket, const tsc_endpoint *source,
                           const void *data, size_t length)
 {
@@ -175,6 +188,7 @@ static void receive_denied(void *user, tsc_udp *socket, const tsc_endpoint *sour
     (void)user; (void)socket; (void)source; (void)data; (void)length;
     ++denied_received;
 }
+#endif
 
 static void pump(void)
 {
@@ -216,6 +230,10 @@ static void configure(void)
     for (i = 0; i < 2; ++i) CHECK(tsc_identity_generate(&identities[i]) == TSC_OK);
     for (i = 0; i < 2; ++i) {
         adapter *node = &net.nodes[i];
+#if TSC_CONTROL_DYNAMIC_PEERS
+        node->map.peers = calloc(1, sizeof(*node->map.peers));
+        CHECK(node->map.peers != NULL);
+#endif
         tsc_control_peer *peer = &node->map.peers[0];
         node->network = &net;
         node->index = i;
@@ -238,7 +256,7 @@ static void configure(void)
         peer->ipv4[3] = (uint8_t)(other + 1);
         peer->has_ipv4 = 1;
         peer->endpoint_count = 1;
-        peer->endpoints[0] = node->outer;
+        tsc_control_endpoint_store(&peer->endpoints[0], &node->outer);
         peer->endpoints[0].port = (uint16_t)(41000 + other);
         if (i == 1)
             CHECK(tsc_policy_parse_json(&node->map.policy, allow_server,
@@ -262,6 +280,7 @@ static void send_raw_from_server(const uint8_t src[4], uint16_t source_port,
                          encrypted_length) == TSC_OK);
 }
 
+#if TSC_APP_UDP && TSC_MAX_UDP_PORTS >= 2
 int main(void)
 {
     tsc_endpoint destination = { .family = TSC_AF_IPV4, .port = 32123 };
@@ -409,6 +428,92 @@ int main(void)
     puts("client tests passed");
     return 0;
 }
+#else
+static unsigned tcp_received;
+static void receive_ip(void *user, const void *data, size_t length)
+{
+    size_t index = (size_t)(uintptr_t)user;
+    const uint8_t *bytes = data;
+    if (bytes[9] == 6) {
+        CHECK(index == 1 && length == 40 && bytes[23] == 80 && bytes[33] == 2);
+        ++tcp_received;
+        return;
+    }
+    tsc_udp_packet_view view;
+    CHECK(tsc_packet_udp_decode(data, length, &view) == TSC_OK);
+    CHECK(view.length == sizeof(payload) - 1 && !memcmp(view.payload, payload, view.length));
+    ++received[index];
+    if (index == 1) {
+        uint8_t reply[TSC_MTU]; size_t n;
+        CHECK(tsc_packet_udp_encode(view.dst, view.src, view.dst_port, view.src_port,
+            payload, sizeof(payload) - 1, 2, reply, sizeof(reply), &n) == TSC_OK);
+        CHECK(tsc_client_send_ip(&clients[1], reply, n) == TSC_OK);
+    }
+}
+static uint16_t checksum(const uint8_t *p, size_t n, uint32_t sum)
+{
+    for (size_t i = 0; i < n; i += 2) sum += ((unsigned)p[i] << 8) | p[i + 1];
+    while (sum >> 16) sum = (sum & 65535) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+int main(void)
+{
+    uint8_t packet[TSC_MTU]; size_t length;
+    configure();
+    for (size_t i = 0; i < 2; ++i) {
+        CHECK(tsc_client_join(&clients[i]) == TSC_OK);
+        tsc_client_set_ip_handler(&clients[i], receive_ip, (void *)(uintptr_t)i);
+    }
+    CHECK(tsc_packet_udp_encode(clients[0].ipv4, clients[1].ipv4, 49000, 32123,
+        payload, sizeof(payload) - 1, 1, packet, sizeof(packet), &length) == TSC_OK);
+    for (unsigned i = 0; i < 30 && !received[0]; ++i) {
+        CHECK(tsc_client_send_ip(&clients[0], packet, length) >= 0);
+        pump();
+    }
+    CHECK(received[0] == 1 && received[1] == 1);
+    CHECK(tsc_packet_udp_encode(clients[0].ipv4, clients[1].ipv4, 49000, 32124,
+        payload, sizeof(payload) - 1, 1, packet, sizeof(packet), &length) == TSC_OK);
+    CHECK(tsc_client_send_ip(&clients[0], packet, length) == TSC_OK);
+    pump();
+    CHECK(received[1] == 1);
+    uint8_t spoof[] = {100, 64, 0, 99};
+    send_raw_from_server(spoof, 32123, 49000, 0);
+    send_raw_from_server(clients[1].ipv4, 32123, 49000, 1);
+    pump();
+    CHECK(received[0] == 1);
+
+    /* A complete TCP SYN reaches the raw IP hook with the private TCP engine
+     * and UDP sockets both disabled. Denial and source ownership still apply. */
+    const char allow_tcp[] = "[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\","
+        "\"Ports\":{\"First\":80,\"Last\":80}}],\"IPProto\":[6]}]";
+    CHECK(tsc_policy_parse_json(&net.nodes[1].map.policy,
+        (const uint8_t *)allow_tcp, strlen(allow_tcp)) == TSC_OK);
+    CHECK(tsc_client_refresh_map(&clients[1]) == TSC_OK);
+    memset(packet, 0, 40);
+    packet[0] = 0x45; packet[3] = 40; packet[8] = 64; packet[9] = 6;
+    memcpy(packet + 12, clients[0].ipv4, 4); memcpy(packet + 16, clients[1].ipv4, 4);
+    packet[20] = 0xc0; packet[23] = 80; packet[27] = 1;
+    packet[32] = 0x50; packet[33] = 2; packet[34] = 8;
+    uint16_t check = checksum(packet, 20, 0);
+    packet[10] = (uint8_t)(check >> 8); packet[11] = (uint8_t)check;
+    uint32_t pseudo = 6 + 20;
+    for (size_t i = 12; i < 20; i += 2) pseudo += ((unsigned)packet[i] << 8) | packet[i + 1];
+    check = checksum(packet + 20, 20, pseudo);
+    packet[36] = (uint8_t)(check >> 8); packet[37] = (uint8_t)check;
+    CHECK(tsc_client_send_ip(&clients[0], packet, 40) == TSC_OK);
+    pump(); CHECK(tcp_received == 1);
+    net.nodes[1].poll_error = TSC_ERR_PROTOCOL;
+    CHECK(tsc_client_refresh_map(&clients[1]) == TSC_ERR_PROTOCOL);
+    CHECK(tsc_client_send_ip(&clients[0], packet, 40) == TSC_OK);
+    pump(); CHECK(tcp_received == 1);
+    tsc_client_close(&clients[0]); tsc_client_close(&clients[1]);
+#if TSC_CONTROL_DYNAMIC_PEERS
+    free(net.nodes[0].map.peers); free(net.nodes[1].map.peers);
+#endif
+    puts("native IP hook tests passed (UDP, TCP, policy and forged source rejection)");
+    return 0;
+}
+#endif
 #else
 int main(void) { return 77; }
 #endif

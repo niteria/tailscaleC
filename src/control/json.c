@@ -226,7 +226,8 @@ int tsc_json_parse(const char *text, size_t length, tsc_json_token *tokens,
     if (count == NULL)
         return TSC_ERR_ARGUMENT;
     *count = 0;
-    if (text == NULL || (tokens == NULL && capacity != 0) || length > UINT32_MAX)
+    if (text == NULL || (tokens == NULL && capacity != 0) ||
+        length > TSC_JSON_NONE || capacity > TSC_JSON_NONE)
         return TSC_ERR_ARGUMENT;
     enum { VALUE, OBJECT_FIRST, ARRAY_FIRST, KEY, AFTER_VALUE } state = VALUE;
     size_t position = 0, used = 0;

@@ -9,6 +9,14 @@
  * receive buffer cannot accept all conforming server records. */
 #define TSC_NOISE_RECORD_SIZE 4096
 #define TSC_NOISE_PLAINTEXT_SIZE (TSC_NOISE_RECORD_SIZE - 19)
+/* The sender may split its byte stream into smaller authenticated records.
+ * Keep the full receive capacity: the coordinator chooses its record sizes. */
+#ifndef TSC_NOISE_TX_RECORD_SIZE
+#define TSC_NOISE_TX_RECORD_SIZE TSC_NOISE_RECORD_SIZE
+#endif
+#if TSC_NOISE_TX_RECORD_SIZE < 64 || TSC_NOISE_TX_RECORD_SIZE > TSC_NOISE_RECORD_SIZE
+#error "Noise transmit record size must be 64..4096"
+#endif
 #ifndef TSC_CONTROL_HEADER_SIZE
 #define TSC_CONTROL_HEADER_SIZE 2048
 #endif
@@ -22,7 +30,7 @@ typedef struct {
     uint64_t tx_nonce, rx_nonce;
     size_t rx_offset, rx_length;
     int ready, failed;
-    uint8_t tx_buffer[TSC_NOISE_RECORD_SIZE];
+    uint8_t tx_buffer[TSC_NOISE_TX_RECORD_SIZE];
     uint8_t rx_buffer[TSC_NOISE_RECORD_SIZE];
 } tsc_noise;
 
@@ -68,5 +76,9 @@ int tsc_h2_post(tsc_h2 *h2, const char *authority, const char *path,
 int tsc_h2_post_map(tsc_h2 *h2, const char *authority, const char *path,
     const void *request, size_t request_length, void *response,
     size_t response_capacity, size_t *response_length, unsigned *http_status);
+/* Deliver the first map's JSON incrementally, without its length prefix. */
+int tsc_h2_post_map_stream(tsc_h2 *h2, const char *authority, const char *path,
+    const void *request, size_t request_length, size_t maximum_json,
+    int (*sink)(void *, const void *, size_t), void *user, unsigned *http_status);
 
 #endif

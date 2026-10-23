@@ -58,7 +58,7 @@ typedef struct {
     uint8_t private_key[32];
     uint8_t public_key[32];
     uint8_t node_key[32];
-    tsc_disco_peer peers[TSC_MAX_PEERS];
+    tsc_disco_peer peers[TSC_CLIENT_PEER_SLOTS];
     tsc_disco_probe_state probes[TSC_DISCO_MAX_PROBES];
     size_t tick_cursor;
 } tsc_disco;
@@ -71,6 +71,10 @@ int tsc_disco_is_packet(const void *packet, size_t length);
 int tsc_disco_set_peer(tsc_disco *disco, const uint8_t node_key[32],
                        const uint8_t disco_key[32],
                        const tsc_endpoint *endpoints, size_t endpoint_count);
+/* Same trusted configuration API with a caller-cached NaCl shared key. */
+int tsc_disco_set_peer_cached(tsc_disco *disco, const uint8_t node_key[32],
+    const uint8_t disco_key[32], const tsc_endpoint *endpoints, size_t endpoint_count,
+    const uint8_t shared_key[32]);
 int tsc_disco_remove_peer(tsc_disco *disco, const uint8_t node_key[32]);
 /* Returns TSC_AGAIN when no currently validated direct endpoint is available. */
 int tsc_disco_endpoint(tsc_disco *disco, const uint8_t node_key[32],

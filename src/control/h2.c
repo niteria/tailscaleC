@@ -465,15 +465,16 @@ static int response_headers(tsc_h2 *h2, frame *f, int *ended)
 static int post(tsc_h2 *h2, const char *authority, const char *path,
     const void *request, size_t request_length, void *response,
     size_t response_capacity, size_t *response_length, unsigned *http_status,
-    int map_mode)
+    int map_mode, int (*sink)(void *, const void *, size_t), void *user)
 {
     const uint8_t *request_bytes = request;
     uint8_t *response_bytes = response;
     size_t position = 0, sent = 0, map_length = 0;
     int result, ended = 0;
     frame f;
+    uint8_t prefix[4], chunk_buffer[256];
     if (!h2 || !authority || !path || (!request && request_length) ||
-        (!response && response_capacity) || !response_length || !http_status)
+        (!response && response_capacity && !sink) || !response_length || !http_status)
         return TSC_ERR_ARGUMENT;
     *response_length = 0; *http_status = 0;
     if (!h2->ready || h2->failed || h2->next_stream > INT32_MAX - 2)
@@ -558,7 +559,8 @@ static int post(tsc_h2 *h2, const char *authority, const char *path,
                 if (length > response_capacity - *response_length)
                     return fail(h2, TSC_ERR_SPACE);
                 if (length) {
-                    result = read_bytes(h2, response_bytes + *response_length, length);
+                    result = sink ? discard(h2, length) :
+                        read_bytes(h2, response_bytes + *response_length, length);
                     if (result != TSC_OK) return result;
                 }
                 *response_length += length;
@@ -572,15 +574,22 @@ static int post(tsc_h2 *h2, const char *authority, const char *path,
                         if (result != TSC_OK) return result;
                         break;
                     }
-                    result = read_bytes(h2, response_bytes + *response_length, chunk);
+                    uint8_t *destination = response_bytes ? response_bytes + *response_length :
+                        *response_length < 4 ? prefix + *response_length : chunk_buffer;
+                    if (sink && *response_length >= 4 && chunk > sizeof(chunk_buffer))
+                        chunk = sizeof(chunk_buffer);
+                    result = read_bytes(h2, destination, chunk);
                     if (result != TSC_OK) return result;
+                    if (sink && *response_length >= 4) {
+                        result = sink(user, destination, chunk);
+                        if (result != TSC_OK) return fail(h2, result);
+                    }
                     *response_length += chunk;
                     length -= (uint32_t)chunk;
                     if (*response_length >= 4 && !map_length) {
-                        uint32_t payload = (uint32_t)response_bytes[0] |
-                            (uint32_t)response_bytes[1] << 8 |
-                            (uint32_t)response_bytes[2] << 16 |
-                            (uint32_t)response_bytes[3] << 24;
+                        const uint8_t *p = sink ? prefix : response_bytes;
+                        uint32_t payload = (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+                            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
                         if (!payload || payload > response_capacity - 4)
                             return fail(h2, payload ? TSC_ERR_SPACE : TSC_ERR_PROTOCOL);
                         map_length = (size_t)payload + 4;
@@ -614,7 +623,7 @@ int tsc_h2_post(tsc_h2 *h2, const char *authority, const char *path,
     size_t response_capacity, size_t *response_length, unsigned *http_status)
 {
     return post(h2, authority, path, request, request_length, response,
-                 response_capacity, response_length, http_status, 0);
+                 response_capacity, response_length, http_status, 0, NULL, NULL);
 }
 
 int tsc_h2_post_map(tsc_h2 *h2, const char *authority, const char *path,
@@ -622,5 +631,15 @@ int tsc_h2_post_map(tsc_h2 *h2, const char *authority, const char *path,
     size_t response_capacity, size_t *response_length, unsigned *http_status)
 {
     return post(h2, authority, path, request, request_length, response,
-                 response_capacity, response_length, http_status, 1);
+                 response_capacity, response_length, http_status, 1, NULL, NULL);
+}
+
+int tsc_h2_post_map_stream(tsc_h2 *h2, const char *authority, const char *path,
+    const void *request, size_t request_length, size_t maximum_json,
+    int (*sink)(void *, const void *, size_t), void *user, unsigned *http_status)
+{
+    size_t received = 0;
+    if (!sink || maximum_json > SIZE_MAX - 4) return TSC_ERR_ARGUMENT;
+    return post(h2, authority, path, request, request_length, NULL,
+        maximum_json + 4, &received, http_status, 1, sink, user);
 }

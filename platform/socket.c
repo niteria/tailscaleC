@@ -1,14 +1,20 @@
-#ifndef ESP_PLATFORM
+#if !defined(ESP_PLATFORM) && !defined(TSC_PLATFORM_LWIP)
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "tailscalec/socket.h"
 #include "system.h"
+#ifdef TSC_PLATFORM_LWIP
+/* Older SDK lwIP uses its own errno and fcntl ABI. Newlib's O_NONBLOCK is
+ * 0x4000 rather than lwIP's 1, and its errno may be a different variable. */
+#include "lwip/errno.h"
+#else
 #include <errno.h>
 #include <fcntl.h>
+#endif
 #include <string.h>
 #include <unistd.h>
 
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) || defined(TSC_PLATFORM_LWIP)
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #else
@@ -21,7 +27,7 @@
 #error "Enable CONFIG_LWIP_IPV6 in ESP-IDF, or set TSC_ENABLE_IPV6 to 0"
 #endif
 
-#if defined(ESP_PLATFORM) || defined(__APPLE__) || defined(__FreeBSD__) || \
+#if defined(ESP_PLATFORM) || defined(TSC_PLATFORM_LWIP) || defined(__APPLE__) || defined(__FreeBSD__) || \
     defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
 #define TSC_SOCKADDR_HAS_LENGTH 1
 #endif
@@ -103,7 +109,7 @@ int tsc_socket_open(tsc_socket *handle, const tsc_endpoint *address)
     flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
         goto fail;
-#ifndef ESP_PLATFORM
+#if !defined(ESP_PLATFORM) && !defined(TSC_PLATFORM_LWIP)
     flags = fcntl(fd, F_GETFD, 0);
     if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
         goto fail;

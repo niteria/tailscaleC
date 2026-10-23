@@ -66,14 +66,14 @@ static int endpoint_decode(tsc_endpoint *ep, const uint8_t in[18]) {
 }
 
 static tsc_disco_peer *find_node(tsc_disco *d, const uint8_t node[32]) {
-    for (size_t i = 0; i < TSC_MAX_PEERS; ++i)
+    for (size_t i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i)
         if (d->peers[i].active && !memcmp(d->peers[i].node_key, node, 32))
             return &d->peers[i];
     return NULL;
 }
 
 static tsc_disco_peer *find_disco(tsc_disco *d, const uint8_t key[32]) {
-    for (size_t i = 0; i < TSC_MAX_PEERS; ++i)
+    for (size_t i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i)
         if (d->peers[i].active && !memcmp(d->peers[i].disco_key, key, 32))
             return &d->peers[i];
     return NULL;
@@ -133,8 +133,8 @@ int tsc_disco_is_packet(const void *packet, size_t length) {
     return packet && length >= DISCO_HEADER_SIZE && !memcmp(packet, disco_magic, 6);
 }
 
-int tsc_disco_set_peer(tsc_disco *d, const uint8_t node[32],
-                       const uint8_t key[32], const tsc_endpoint *eps, size_t count) {
+static int set_peer(tsc_disco *d, const uint8_t node[32],
+    const uint8_t key[32], const tsc_endpoint *eps, size_t count, const uint8_t *cached) {
     uint8_t shared[32];
     if (!d || !d->platform.monotonic_ms || !node || !key ||
         all_zero(node, 32) || all_zero(key, 32) || (!eps && count))
@@ -148,13 +148,15 @@ int tsc_disco_set_peer(tsc_disco *d, const uint8_t node[32],
      * give an authenticated packet to the wrong node. */
     if (same_key && same_key != p) return TSC_ERR_ARGUMENT;
     if (!p) {
-        for (size_t i = 0; i < TSC_MAX_PEERS; ++i)
+        for (size_t i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i)
             if (!d->peers[i].active) { p = &d->peers[i]; break; }
     }
     if (!p) return TSC_ERR_SPACE;
     int changed = !p->active || memcmp(p->disco_key, key, 32);
     if (changed) {
-        int status = tsc_nacl_box_beforenm(shared, key, d->private_key);
+        int status = TSC_OK;
+        if (cached) memcpy(shared, cached, sizeof(shared));
+        else status = tsc_nacl_box_beforenm(shared, key, d->private_key);
         if (status != TSC_OK) return status;
         clear_peer_probes(d, (size_t)(p - d->peers));
         tsc_crypto_zero(p, sizeof(*p));
@@ -169,6 +171,16 @@ int tsc_disco_set_peer(tsc_disco *d, const uint8_t node[32],
     p->probe_cursor = 0;
     p->next_probe_ms = 0;
     return TSC_OK;
+}
+
+int tsc_disco_set_peer(tsc_disco *d, const uint8_t node[32],
+    const uint8_t key[32], const tsc_endpoint *eps, size_t count) {
+    return set_peer(d, node, key, eps, count, NULL);
+}
+int tsc_disco_set_peer_cached(tsc_disco *d, const uint8_t node[32],
+    const uint8_t key[32], const tsc_endpoint *eps, size_t count, const uint8_t shared[32]) {
+    if (!shared) return TSC_ERR_ARGUMENT;
+    return set_peer(d, node, key, eps, count, shared);
 }
 
 int tsc_disco_remove_peer(tsc_disco *d, const uint8_t node[32]) {
@@ -192,7 +204,7 @@ int tsc_disco_endpoint(tsc_disco *d, const uint8_t node[32], tsc_endpoint *ep) {
 
 static size_t peer_quota(const tsc_disco *d) {
     size_t active_peers = 0;
-    for (size_t i = 0; i < TSC_MAX_PEERS; ++i) active_peers += d->peers[i].active != 0;
+    for (size_t i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i) active_peers += d->peers[i].active != 0;
     size_t quota = TSC_DISCO_MAX_PROBES / active_peers;
     return quota ? quota : 1;
 }
@@ -285,9 +297,9 @@ int tsc_disco_tick(tsc_disco *d) {
     if (!d || !d->platform.monotonic_ms) return TSC_ERR_ARGUMENT;
     uint64_t now = d->platform.monotonic_ms(d->platform.user);
     expire(d, now);
-    for (size_t n = 0; n < TSC_MAX_PEERS; ++n) {
+    for (size_t n = 0; n < TSC_CLIENT_PEER_SLOTS; ++n) {
         size_t i = d->tick_cursor;
-        d->tick_cursor = (d->tick_cursor + 1) % TSC_MAX_PEERS;
+        d->tick_cursor = (d->tick_cursor + 1) % TSC_CLIENT_PEER_SLOTS;
         if (d->peers[i].active && now >= d->peers[i].next_probe_ms) {
             int status = tsc_disco_probe(d, d->peers[i].node_key, 1);
             return status == TSC_ERR_SPACE ? TSC_AGAIN : status;

@@ -39,6 +39,38 @@
 #ifndef TSC_MAX_PEERS
 #define TSC_MAX_PEERS 8
 #endif
+#ifndef TSC_SESSION_CACHE
+#define TSC_SESSION_CACHE 0
+#endif
+#ifndef TSC_MAX_SESSIONS
+#define TSC_MAX_SESSIONS TSC_MAX_PEERS
+#endif
+#if TSC_SESSION_CACHE
+/* One probationary slot authenticates a handshake before replacing a session. */
+#define TSC_CLIENT_PEER_SLOTS (TSC_MAX_SESSIONS + 1)
+#else
+#define TSC_CLIENT_PEER_SLOTS TSC_MAX_PEERS
+#endif
+#ifndef TSC_CONTROL_COMPACT_PEERS
+#define TSC_CONTROL_COMPACT_PEERS 0
+#endif
+#ifndef TSC_CONTROL_DYNAMIC_PEERS
+#define TSC_CONTROL_DYNAMIC_PEERS 0
+#endif
+#if TSC_CONTROL_COMPACT_PEERS
+#define TSC_CONTROL_PEER_NAME_SIZE 1
+#else
+#define TSC_CONTROL_PEER_NAME_SIZE 128
+#endif
+#if TSC_MAX_SESSIONS < 1 || TSC_MAX_SESSIONS > TSC_MAX_PEERS
+#error "Session capacity must be between one and the peer-directory capacity"
+#endif
+#if TSC_CONTROL_COMPACT_PEERS && TSC_ENABLE_IPV6
+#error "Compact endpoint storage requires IPv4 outer transport"
+#endif
+#if TSC_CONTROL_DYNAMIC_PEERS && (!TSC_CONTROL_SINGLE_MAP || !TSC_CONTROL_PROJECT_MAP)
+#error "Dynamic peer storage requires single-map streaming control"
+#endif
 #ifndef TSC_MAX_PEER_ENDPOINTS
 #define TSC_MAX_PEER_ENDPOINTS 8
 #endif
@@ -78,7 +110,7 @@
 #define TSC_MAX_FILTER_RULES 32
 #endif
 #ifndef TSC_DISCO_MAX_PROBES
-#define TSC_DISCO_MAX_PROBES (2 * TSC_MAX_PEERS)
+#define TSC_DISCO_MAX_PROBES (2 * TSC_CLIENT_PEER_SLOTS)
 #endif
 #ifndef TSC_DERP_MAX_HTTP_HEADER
 #define TSC_DERP_MAX_HTTP_HEADER 1024

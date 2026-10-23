@@ -29,6 +29,8 @@ enum {
  * across restarts (normally UTC seconds + 0x400000000000000a, nanoseconds).
  * A persisted monotonic counter is also suitable. Never use a boot-only clock.
  * Every hook is required. random_bytes must use a cryptographic RNG. */
+struct tsc_wg;
+struct tsc_wg_peer;
 typedef struct {
     void *user;
     int (*random_bytes)(void *user, void *buffer, size_t length);
@@ -88,6 +90,10 @@ typedef struct tsc_wg {
     tsc_wg_peer *peers;
     size_t peer_capacity;
     tsc_wg_hooks hooks;
+    /* Optional mapped-peer lookup, set after init. Use probationary storage:
+     * the decrypted static key alone is not peer authentication. */
+    tsc_wg_peer *(*resolve_peer)(void *user, struct tsc_wg *device,
+                                 const uint8_t public_key[32]);
     uint8_t last_timestamp[12];
     bool valid, random_failed, timestamp_failed;
 } tsc_wg;

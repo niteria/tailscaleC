@@ -3,9 +3,23 @@
 #if TSC_ENABLE_CLIENT
 #include "tailscalec/crypto.h"
 #include "tailscalec/packet.h"
+#include "tailscalec/nacl.h"
+#include <stdlib.h>
 #include <string.h>
 
 #define TSC_CLIENT_RECEIVE_BUDGET 16u
+
+#if TSC_SESSION_CACHE
+typedef struct tsc_peer_history {
+    uint8_t key[32], timestamp[12];
+#if TSC_ENABLE_DISCO
+    uint8_t disco_key[32], shared_key[32];
+    unsigned shared_valid;
+#endif
+    uint64_t last_initiation_rx;
+} tsc_peer_history;
+static tsc_wg_peer *cached_resolve(void *, tsc_wg *, const uint8_t[32]);
+#endif
 
 static int nonzero(const uint8_t *bytes, size_t length)
 {
@@ -57,10 +71,10 @@ static int wg_timestamp(void *user, uint8_t timestamp[12])
 static size_t peer_by_key(const tsc_client *client, const uint8_t key[32])
 {
     size_t i;
-    for (i = 0; i < TSC_MAX_PEERS; ++i)
+    for (i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i)
         if (client->peers[i].active &&
             memcmp(client->peers[i].public_key, key, 32) == 0) return i;
-    return TSC_MAX_PEERS;
+    return TSC_CLIENT_PEER_SLOTS;
 }
 
 int tsc_client_set_peer_endpoint(tsc_client *client, const uint8_t node_key[32],
@@ -70,7 +84,7 @@ int tsc_client_set_peer_endpoint(tsc_client *client, const uint8_t node_key[32],
     if (!client || !client->initialized || !node_key || !valid_endpoint(endpoint))
         return TSC_ERR_ARGUMENT;
     i = peer_by_key(client, node_key);
-    if (i == TSC_MAX_PEERS) return TSC_ERR_ARGUMENT;
+    if (i == TSC_CLIENT_PEER_SLOTS) return TSC_ERR_ARGUMENT;
     client->peers[i].endpoint = *endpoint;
     client->peers[i].has_endpoint = 1;
     client->peers[i].endpoint_millis = wg_now(client);
@@ -109,6 +123,8 @@ int tsc_client_init(tsc_client *client, const tsc_client_config *config)
         !nonzero(config->identity->node_private, 32) ||
         !nonzero(config->identity->disco_private, 32) || client->initialized)
         return TSC_ERR_ARGUMENT;
+    for (size_t i = 0; i < config->endpoint_count; ++i)
+        if (config->endpoint_types && config->endpoint_types[i] > 5) return TSC_ERR_ARGUMENT;
     memset(client, 0, sizeof(*client));
     client->identity = *config->identity;
     client->platform = config->platform;
@@ -118,6 +134,8 @@ int tsc_client_init(tsc_client *client, const tsc_client_config *config)
     client->relay_user = config->relay_user;
     client->next_port = 49152;
     client->endpoint_count = config->endpoint_count;
+    for (size_t i = 0; i < config->endpoint_count; ++i)
+        client->endpoint_types[i] = config->endpoint_types ? config->endpoint_types[i] : 1;
     if (config->endpoint_count)
         memcpy(client->endpoints, config->endpoints,
                  config->endpoint_count * sizeof(*config->endpoints));
@@ -133,6 +151,7 @@ int tsc_client_init(tsc_client *client, const tsc_client_config *config)
     client->control_config.timeout_ms = config->control_timeout_ms;
     client->control_config.platform = &client->platform;
     client->control_config.endpoints = client->endpoints;
+    client->control_config.endpoint_types = client->endpoint_types;
     client->control_config.endpoint_count = client->endpoint_count;
     client->control_config.preferred_derp = config->preferred_derp;
     memcpy(client->control_config.machine_private_key,
@@ -146,9 +165,12 @@ int tsc_client_init(tsc_client *client, const tsc_client_config *config)
     hooks.random_bytes = wg_random;
     hooks.monotonic_ms = wg_now;
     hooks.tai64n_now = wg_timestamp;
-    rc = tsc_wg_init(&client->wireguard, client->wg_peers, TSC_MAX_PEERS,
+    rc = tsc_wg_init(&client->wireguard, client->wg_peers, TSC_CLIENT_PEER_SLOTS,
                       client->identity.node_private, &hooks);
     if (rc != TSC_OK) goto fail;
+#if TSC_SESSION_CACHE
+    client->wireguard.resolve_peer = cached_resolve;
+#endif
 #if TSC_ENABLE_DISCO
     {
         tsc_disco_callbacks callbacks = {0};
@@ -177,12 +199,218 @@ static void forget_peer_flows(tsc_client *client, const uint8_t address[4])
             memset(&client->flows[i], 0, sizeof(client->flows[i]));
 }
 
+static const tsc_control_peer *mapped_key(const tsc_client *client, const uint8_t key[32])
+{
+    const tsc_control_map *map = tsc_control_get_map(&client->control);
+    if (map) for (size_t i = 0; i < map->peer_count; ++i)
+        if (!memcmp(map->peers[i].public_key, key, 32)) return &map->peers[i];
+    return NULL;
+}
+
+static void fill_peer(tsc_client_peer *target, const tsc_control_peer *source)
+{
+    target->active = 1;
+    target->has_ipv4 = source->has_ipv4;
+    memcpy(target->public_key, source->public_key, 32);
+    memcpy(target->ipv4, source->ipv4, 4);
+    target->candidate_count = 0;
+    for (size_t j = 0; j < source->endpoint_count; ++j) {
+        tsc_endpoint ep = tsc_control_endpoint_load(&source->endpoints[j]);
+        if (valid_endpoint(&ep)) target->candidates[target->candidate_count++] = ep;
+    }
+}
+
+#if TSC_SESSION_CACHE
+#define PROBATION_SLOT TSC_MAX_SESSIONS
+static tsc_peer_history *history_key(tsc_client *c, const uint8_t key[32])
+{
+    for (size_t i = 0; i < c->history_count; ++i)
+        if (!memcmp(c->history[i].key, key, 32)) return &c->history[i];
+    return NULL;
+}
+static void remember_handshake(tsc_client *c, size_t slot)
+{
+    tsc_wg_peer *p = &c->wg_peers[slot];
+    tsc_peer_history *h = p->valid ? history_key(c, p->public_key) : NULL;
+    if (h && memcmp(p->greatest_timestamp, h->timestamp, 12) > 0) {
+        memcpy(h->timestamp, p->greatest_timestamp, 12);
+        h->last_initiation_rx = p->last_initiation_rx;
+    }
+}
+static int history_sync(tsc_client *c, const tsc_control_map *map)
+{
+    for (size_t i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i) remember_handshake(c, i);
+    tsc_peer_history *next = map->peer_count ? calloc(map->peer_count, sizeof(*next)) : NULL;
+    if (map->peer_count && !next) return TSC_ERR_SPACE;
+    for (size_t i = 0; i < map->peer_count; ++i) {
+        const tsc_control_peer *p = &map->peers[i];
+        tsc_peer_history *old = history_key(c, p->public_key);
+        if (old) next[i] = *old;
+        memcpy(next[i].key, p->public_key, 32);
+#if TSC_ENABLE_DISCO
+        if (memcmp(next[i].disco_key, p->disco_key, 32)) {
+            next[i].shared_valid = 0;
+            tsc_crypto_zero(next[i].shared_key, 32);
+            memcpy(next[i].disco_key, p->disco_key, 32);
+        }
+#endif
+    }
+    tsc_crypto_zero(c->history, c->history_count * sizeof(*c->history));
+    free(c->history);
+    c->history = next; c->history_count = map->peer_count;
+    return TSC_OK;
+}
+static void clear_slot(tsc_client *c, size_t slot, int revoked)
+{
+    remember_handshake(c, slot);
+    if (revoked) forget_peer_flows(c, c->peers[slot].ipv4);
+#if TSC_ENABLE_DISCO
+    if (c->peers[slot].active) tsc_disco_remove_peer(&c->disco, c->peers[slot].public_key);
+#endif
+    tsc_wg_peer_remove(&c->wireguard, slot);
+    memset(&c->peers[slot], 0, sizeof(c->peers[slot]));
+}
+static int stage_peer(tsc_client *c, const tsc_control_peer *p, int initiate)
+{
+    if (!p || !p->has_ipv4) return TSC_ERR_ARGUMENT;
+    size_t slot = peer_by_key(c, p->public_key);
+    if (slot < TSC_CLIENT_PEER_SLOTS) return (int)slot;
+    slot = PROBATION_SLOT;
+    clear_slot(c, slot, 0);
+    ++c->probe_generation;
+    int r = tsc_wg_peer_set(&c->wireguard, slot, p->public_key, NULL);
+    if (r) return r;
+    fill_peer(&c->peers[slot], p);
+    c->peers[slot].initiate_pending = (unsigned)initiate;
+    c->peers[slot].last_used_ms = wg_now(c);
+    tsc_peer_history *h = history_key(c, p->public_key);
+    if (h) {
+        memcpy(c->wg_peers[slot].greatest_timestamp, h->timestamp, 12);
+        c->wg_peers[slot].last_initiation_rx = h->last_initiation_rx;
+        c->wg_peers[slot].initiation_received = nonzero(h->timestamp, 12) != 0;
+    }
+    return (int)slot;
+}
+static tsc_wg_peer *cached_resolve(void *user, tsc_wg *device, const uint8_t key[32])
+{
+    tsc_client *c = user;
+    if (device != &c->wireguard || !c->allow_traffic) return NULL;
+    const tsc_control_peer *p = mapped_key(c, key);
+    if (!p) return NULL;
+    int slot = stage_peer(c, p, 0);
+    return slot >= 0 ? &c->wg_peers[slot] : NULL;
+}
+#if TSC_ENABLE_DISCO
+static int cache_disco(tsc_client *c, const tsc_control_peer *p)
+{
+    if (!nonzero(p->disco_key, 32)) return TSC_AGAIN;
+    tsc_peer_history *h = history_key(c, p->public_key);
+    if (!h) return TSC_ERR_PROTOCOL;
+    if (!h->shared_valid) {
+        int r = tsc_nacl_box_beforenm(h->shared_key, p->disco_key, c->identity.disco_private);
+        if (r) return r;
+        h->shared_valid = 1;
+    }
+    tsc_endpoint endpoints[TSC_CONTROL_MAX_ENDPOINTS]; size_t count = 0;
+    for (size_t i = 0; i < p->endpoint_count; ++i) {
+        tsc_endpoint ep = tsc_control_endpoint_load(&p->endpoints[i]);
+        if (valid_endpoint(&ep)) endpoints[count++] = ep;
+    }
+    return tsc_disco_set_peer_cached(&c->disco, p->public_key, p->disco_key,
+                                    endpoints, count, h->shared_key);
+}
+static void clear_sweep(tsc_client *c)
+{
+    if (nonzero(c->sweep_key, 32) && peer_by_key(c, c->sweep_key) == TSC_CLIENT_PEER_SLOTS)
+        tsc_disco_remove_peer(&c->disco, c->sweep_key);
+    memset(c->sweep_key, 0, sizeof(c->sweep_key));
+}
+static void discovery_sweep(tsc_client *c)
+{
+    uint64_t now = wg_now(c);
+    if (now < c->next_sweep_ms) return;
+    c->next_sweep_ms = now + 500;
+    clear_sweep(c);
+    const tsc_control_map *map = tsc_control_get_map(&c->control);
+    for (size_t n = 0; n < map->peer_count; ++n) {
+        c->sweep_cursor %= map->peer_count;
+        const tsc_control_peer *p = &map->peers[c->sweep_cursor++];
+        if (!p->online || !p->has_ipv4 || !p->endpoint_count ||
+            peer_by_key(c, p->public_key) != TSC_CLIENT_PEER_SLOTS) continue;
+        if (cache_disco(c, p) == TSC_OK) {
+            memcpy(c->sweep_key, p->public_key, 32);
+            (void)tsc_disco_probe(&c->disco, p->public_key, 0);
+        }
+        break;
+    }
+}
+static int cached_discovery(tsc_client *c, const tsc_endpoint *source,
+    const uint8_t *relay, const uint8_t *packet, size_t length)
+{
+    if (length < 62) return TSC_ERR_PROTOCOL;
+    const tsc_control_map *map = tsc_control_get_map(&c->control);
+    const tsc_control_peer *p = NULL;
+    for (size_t i = 0; i < map->peer_count; ++i)
+        if (!memcmp(map->peers[i].disco_key, packet + 6, 32)) { p = &map->peers[i]; break; }
+    if (!p || (relay && memcmp(relay, p->public_key, 32))) return TSC_ERR_PROTOCOL;
+    int temporary = peer_by_key(c, p->public_key) == TSC_CLIENT_PEER_SLOTS;
+    if (temporary && memcmp(c->sweep_key, p->public_key, 32)) clear_sweep(c);
+    int present = 0;
+    for (size_t i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i)
+        if (c->disco.peers[i].active && !memcmp(c->disco.peers[i].node_key, p->public_key, 32))
+            present = 1;
+    if (!present) {
+        int r = cache_disco(c, p);
+        if (r) return r;
+    }
+    if (temporary) memcpy(c->sweep_key, p->public_key, 32);
+    return source ? tsc_disco_receive(&c->disco, source, packet, length) :
+        tsc_disco_receive_relay(&c->disco, relay, packet, length);
+}
+#endif
+static size_t promote_peer(tsc_client *c)
+{
+    size_t slot = 0;
+    for (size_t i = 0; i < TSC_MAX_SESSIONS; ++i) {
+        if (!c->peers[i].active) { slot = i; break; }
+        if (c->peers[i].last_used_ms < c->peers[slot].last_used_ms) slot = i;
+    }
+    clear_slot(c, slot, 0);
+    c->wg_peers[slot] = c->wg_peers[PROBATION_SLOT];
+    c->peers[slot] = c->peers[PROBATION_SLOT];
+    tsc_wg_peer_remove(&c->wireguard, PROBATION_SLOT);
+    memset(&c->peers[PROBATION_SLOT], 0, sizeof(c->peers[PROBATION_SLOT]));
+#if TSC_ENABLE_DISCO
+    const tsc_control_peer *p = mapped_key(c, c->peers[slot].public_key);
+    if (p) (void)cache_disco(c, p);
+#endif
+    return slot;
+}
+static void recover_transport(tsc_client *c, const tsc_endpoint *source)
+{
+    if (!source) return;
+    if (c->peers[PROBATION_SLOT].active &&
+        wg_now(c) - c->peers[PROBATION_SLOT].last_used_ms < 5000) return;
+    const tsc_control_map *map = tsc_control_get_map(&c->control);
+    for (size_t i = 0; i < map->peer_count; ++i) {
+        const tsc_control_peer *p = &map->peers[i];
+        if (!p->has_ipv4 || peer_by_key(c, p->public_key) != TSC_CLIENT_PEER_SLOTS) continue;
+        for (size_t j = 0; j < p->endpoint_count; ++j) {
+            tsc_endpoint ep = tsc_control_endpoint_load(&p->endpoints[j]);
+            if (tsc_endpoint_equal(&ep, source)) { (void)stage_peer(c, p, 1); return; }
+        }
+    }
+}
+#endif
+
 static int install_map(tsc_client *client)
 {
     const tsc_control_map *map = tsc_control_get_map(&client->control);
-    unsigned retained[TSC_MAX_PEERS] = {0};
+#if !TSC_SESSION_CACHE
+    unsigned retained[TSC_CLIENT_PEER_SLOTS] = {0};
+#endif
     uint8_t policy_digest[32];
-    size_t i, j, slot;
+    size_t i, j;
     int rc;
     client->allow_traffic = 0;
     if (!map || !map->has_ipv4 || !nonzero(map->ipv4, 4) ||
@@ -204,7 +432,14 @@ static int install_map(tsc_client *client)
                 return TSC_ERR_PROTOCOL;
     }
     /* Remove absent keys first, so a full map can replace all peers. */
-    for (i = 0; i < TSC_MAX_PEERS; ++i) {
+#if TSC_SESSION_CACHE
+    rc = history_sync(client, map);
+    if (rc) return rc;
+#if TSC_ENABLE_DISCO
+    clear_sweep(client);
+#endif
+#endif
+    for (i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i) {
         if (!client->peers[i].active) continue;
         for (j = 0; j < map->peer_count; ++j)
             if (memcmp(client->peers[i].public_key,
@@ -219,13 +454,25 @@ static int install_map(tsc_client *client)
             memset(&client->peers[i], 0, sizeof(client->peers[i]));
         }
     }
+#if TSC_SESSION_CACHE
+    for (i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i) {
+        if (!client->peers[i].active) continue;
+        const tsc_control_peer *peer = mapped_key(client, client->peers[i].public_key);
+        if (memcmp(client->peers[i].ipv4, peer->ipv4, 4))
+            forget_peer_flows(client, client->peers[i].ipv4);
+        fill_peer(&client->peers[i], peer);
+#if TSC_ENABLE_DISCO
+        if (i != PROBATION_SLOT) (void)cache_disco(client, peer);
+#endif
+    }
+#else
     for (i = 0; i < map->peer_count; ++i) {
         const tsc_control_peer *peer = &map->peers[i];
-        slot = peer_by_key(client, peer->public_key);
-        if (slot == TSC_MAX_PEERS)
-            for (slot = 0; slot < TSC_MAX_PEERS; ++slot)
+        size_t slot = peer_by_key(client, peer->public_key);
+        if (slot == TSC_CLIENT_PEER_SLOTS)
+            for (slot = 0; slot < TSC_CLIENT_PEER_SLOTS; ++slot)
                 if (!client->peers[slot].active && !retained[slot]) break;
-        if (slot == TSC_MAX_PEERS) return TSC_ERR_SPACE;
+        if (slot == TSC_CLIENT_PEER_SLOTS) return TSC_ERR_SPACE;
         rc = tsc_wg_peer_set(&client->wireguard, slot, peer->public_key, NULL);
         if (rc != TSC_OK) return rc;
         if (!client->peers[slot].active || !client->wg_peers[slot].active)
@@ -233,15 +480,7 @@ static int install_map(tsc_client *client)
         if (client->peers[slot].active &&
             memcmp(client->peers[slot].ipv4, peer->ipv4, 4) != 0)
             forget_peer_flows(client, client->peers[slot].ipv4);
-        client->peers[slot].active = 1;
-        client->peers[slot].has_ipv4 = peer->has_ipv4;
-        memcpy(client->peers[slot].public_key, peer->public_key, 32);
-        memcpy(client->peers[slot].ipv4, peer->ipv4, 4);
-        client->peers[slot].candidate_count = 0;
-        for (j = 0; j < peer->endpoint_count; ++j)
-            if (valid_endpoint(&peer->endpoints[j]))
-                client->peers[slot].candidates[
-                    client->peers[slot].candidate_count++] = peer->endpoints[j];
+        fill_peer(&client->peers[slot], peer);
         retained[slot] = 1;
 #if TSC_ENABLE_DISCO
         if (nonzero(peer->disco_key, 32)) {
@@ -256,6 +495,7 @@ static int install_map(tsc_client *client)
         }
 #endif
     }
+#endif
     if (memcmp(client->policy_digest, policy_digest, 32) != 0 ||
         memcmp(client->ipv4, map->ipv4, 4) != 0) {
         memset(client->flows, 0, sizeof(client->flows));
@@ -272,7 +512,10 @@ static void invalidate_dataplane(tsc_client *client)
 {
     size_t i;
     client->allow_traffic = 0;
-    for (i = 0; i < TSC_MAX_PEERS; ++i) {
+    for (i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i) {
+#if TSC_SESSION_CACHE
+        remember_handshake(client, i);
+#endif
 #if TSC_ENABLE_DISCO
         if (client->peers[i].active)
             (void)tsc_disco_remove_peer(&client->disco,
@@ -348,19 +591,25 @@ int tsc_client_maintain(tsc_client *client, uint32_t max_age_ms)
 }
 
 int tsc_client_set_endpoints(tsc_client *client, const tsc_endpoint *endpoints,
-                              size_t count)
+                               size_t count)
+{
+    return tsc_client_set_endpoints_typed(client, endpoints, NULL, count);
+}
+int tsc_client_set_endpoints_typed(tsc_client *client, const tsc_endpoint *endpoints,
+                                  const uint8_t *types, size_t count)
 {
     size_t i;
     int rc;
     if (!client || !client->initialized || count > TSC_CONTROL_MAX_ENDPOINTS ||
         (!endpoints && count)) return TSC_ERR_ARGUMENT;
     for (i = 0; i < count; ++i)
-        if (!valid_endpoint(&endpoints[i])) return TSC_ERR_ARGUMENT;
+        if (!valid_endpoint(&endpoints[i]) || (types && types[i] > 5)) return TSC_ERR_ARGUMENT;
     if (client->control.implementation) {
-        rc = tsc_control_set_endpoints(&client->control, endpoints, count);
+        rc = tsc_control_set_endpoints_typed(&client->control, endpoints, types, count);
         if (rc != TSC_OK) return rc;
     }
     if (count) memmove(client->endpoints, endpoints, count * sizeof(*endpoints));
+    for (i = 0; i < count; ++i) client->endpoint_types[i] = types ? types[i] : 1;
     client->endpoint_count = count;
     client->control_config.endpoint_count = count;
     return TSC_OK;
@@ -381,6 +630,10 @@ void tsc_client_close(tsc_client *client)
         tsc_disco_clear(&client->disco);
 #endif
         tsc_wg_destroy(&client->wireguard);
+#if TSC_SESSION_CACHE
+        tsc_crypto_zero(client->history, client->history_count * sizeof(*client->history));
+        free(client->history);
+#endif
     }
     tsc_crypto_zero(client, sizeof(*client));
 }
@@ -604,16 +857,31 @@ static int receive_wireguard(tsc_client *client, const tsc_endpoint *source,
     tsc_wg_event event;
     int rc = current_map(client);
     if (rc != TSC_OK) return rc;
+#if TSC_SESSION_CACHE
+    unsigned probe_generation = client->probe_generation;
+#endif
     rc = tsc_wg_receive(&client->wireguard, packet, length,
                             client->inner_buffer, sizeof(client->inner_buffer),
                             &event);
-    if (rc != TSC_OK) return rc;
+    if (rc != TSC_OK) {
+#if TSC_SESSION_CACHE
+        if (probe_generation != client->probe_generation) clear_slot(client, PROBATION_SLOT, 0);
+        if (length >= TSC_WG_OVERHEAD && ((const uint8_t *)packet)[0] == 4)
+            recover_transport(client, source);
+#endif
+        return rc;
+    }
     if (event.authenticated) {
-        if (event.peer_index >= TSC_MAX_PEERS ||
+        if (event.peer_index >= TSC_CLIENT_PEER_SLOTS ||
             !client->peers[event.peer_index].active ||
             (relay_key && memcmp(relay_key,
                 client->peers[event.peer_index].public_key, 32) != 0))
             return TSC_ERR_PROTOCOL;
+#if TSC_SESSION_CACHE
+        remember_handshake(client, event.peer_index);
+        if (event.peer_index == PROBATION_SLOT) event.peer_index = promote_peer(client);
+#endif
+        client->peers[event.peer_index].last_used_ms = wg_now(client);
         client->peers[event.peer_index].initiate_pending = 0;
         if (source && valid_endpoint(source)) {
             client->peers[event.peer_index].endpoint = *source;
@@ -644,10 +912,15 @@ int tsc_client_receive_relay(tsc_client *client, const uint8_t node_key[32],
         length > TSC_MAX_DATAGRAM_SIZE) return TSC_ERR_ARGUMENT;
     rc = current_map(client);
     if (rc != TSC_OK) return rc;
-    if (peer_by_key(client, node_key) == TSC_MAX_PEERS) return TSC_ERR_PROTOCOL;
+    if (!mapped_key(client, node_key)) return TSC_ERR_PROTOCOL;
 #if TSC_ENABLE_DISCO
-    if (tsc_disco_is_packet(packet, length))
+    if (tsc_disco_is_packet(packet, length)) {
+#if TSC_SESSION_CACHE
+        return cached_discovery(client, NULL, node_key, packet, length);
+#else
         return tsc_disco_receive_relay(&client->disco, node_key, packet, length);
+#endif
+    }
 #endif
     return receive_wireguard(client, NULL, node_key, packet, length);
 }
@@ -672,8 +945,12 @@ int tsc_client_poll(tsc_client *client)
         activity = 1;
 #if TSC_ENABLE_DISCO
         if (tsc_disco_is_packet(client->receive_buffer, length)) {
+#if TSC_SESSION_CACHE
+            (void)cached_discovery(client, &source, NULL, client->receive_buffer, length);
+#else
             (void)tsc_disco_receive(&client->disco, &source,
                                     client->receive_buffer, length);
+#endif
             continue;
         }
 #endif
@@ -683,7 +960,7 @@ int tsc_client_poll(tsc_client *client)
                                  client->receive_buffer, length);
         if (!client->allow_traffic) return rc;
     }
-    for (i = 0; i < TSC_MAX_PEERS; ++i) {
+    for (i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i) {
         if (!client->peers[i].active) continue;
         /* Proactive startup replaces a remote peer's stale session after our
          * process restarts with its persisted identity. Only authenticated
@@ -707,6 +984,14 @@ int tsc_client_poll(tsc_client *client)
             activity = 1;
         }
     }
+#if TSC_SESSION_CACHE
+    if (client->peers[PROBATION_SLOT].active &&
+        wg_now(client) - client->peers[PROBATION_SLOT].last_used_ms > 10000)
+        clear_slot(client, PROBATION_SLOT, 0);
+#if TSC_ENABLE_DISCO
+    discovery_sweep(client);
+#endif
+#endif
 #if TSC_ENABLE_DISCO
     rc = tsc_disco_tick(&client->disco);
     if (rc < 0 && rc != TSC_ERR_PROTOCOL) return rc;
@@ -734,10 +1019,38 @@ int tsc_client_send_ip(tsc_client *client, const void *packet, size_t length)
     if (rc != TSC_OK || actual != length || !transport_valid(bytes, length))
         return TSC_ERR_PROTOCOL;
     if (memcmp(bytes + 12, client->ipv4, 4) != 0) return TSC_ERR_ARGUMENT;
-    for (i = 0; i < TSC_MAX_PEERS; ++i)
+    for (i = 0; i < TSC_CLIENT_PEER_SLOTS; ++i)
         if (client->peers[i].active && client->peers[i].has_ipv4 &&
             memcmp(bytes + 16, client->peers[i].ipv4, 4) == 0) break;
-    if (i == TSC_MAX_PEERS) return TSC_AGAIN;
+    if (i == TSC_CLIENT_PEER_SLOTS) {
+#if TSC_SESSION_CACHE
+        const tsc_control_map *map = tsc_control_get_map(&client->control);
+        const tsc_control_peer *peer = NULL;
+        for (size_t j = 0; j < map->peer_count; ++j)
+            if (map->peers[j].has_ipv4 && !memcmp(map->peers[j].ipv4, bytes + 16, 4)) {
+                peer = &map->peers[j]; break;
+            }
+        if (!peer) return TSC_AGAIN;
+        rc = stage_peer(client, peer, 1);
+        if (rc < 0) return rc;
+        i = (size_t)rc;
+#else
+        return TSC_AGAIN;
+#endif
+    }
+    client->peers[i].last_used_ms = wg_now(client);
+#if TSC_SESSION_CACHE
+    if (i == PROBATION_SLOT) {
+        rc = tsc_wg_start(&client->wireguard, i, client->send_buffer,
+                          sizeof(client->send_buffer), &written);
+        if (rc != TSC_OK && rc != TSC_AGAIN) return rc;
+        if (written) {
+            rc = transmit(client, i, client->send_buffer, written);
+            if (rc < 0) return rc;
+        }
+        return TSC_AGAIN;
+    }
+#endif
     rc = tsc_wg_encrypt(&client->wireguard, i, packet, length,
                          client->send_buffer, sizeof(client->send_buffer),
                          &written);

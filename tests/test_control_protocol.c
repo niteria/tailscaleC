@@ -118,18 +118,23 @@ static void test_noise(void)
     CHECK(noise.rx_nonce == 3);
     CHECK(tsc_noise_send(&noise, data, sizeof(data)) == TSC_OK);
     offset = 0;
-    for (i = 0; i < 2; ++i) {
+    size_t destination = 0;
+    for (i = 0; offset < mock.output_size; ++i) {
         const uint8_t *p = mock.output + offset;
+        CHECK(mock.output_size - offset >= 3);
         size_t length = (size_t)p[1] << 8 | p[2];
-        size_t destination = i ? TSC_NOISE_PLAINTEXT_SIZE : 0;
         CHECK(p[0] == 4 && length >= 16 && length <= TSC_NOISE_RECORD_SIZE - 3);
+        CHECK(length + 3 <= mock.output_size - offset);
+        CHECK(length - 16 <= sizeof(buffer) - destination);
         counter_nonce(nonce, i);
         CHECK(tsc_crypto_chacha20poly1305_decrypt(key, nonce, NULL, 0,
                   p + 3, length - 16, p + 3 + length - 16,
                   buffer + destination) == TSC_OK);
         offset += length + 3;
+        destination += length - 16;
     }
-    CHECK(offset == mock.output_size && !memcmp(data, buffer, sizeof(data)));
+    CHECK(destination == sizeof(data) && offset == mock.output_size &&
+          !memcmp(data, buffer, sizeof(data)));
 
     setup(&noise, &stream, 3);
     record(data, 20);
@@ -185,6 +190,18 @@ static void start_h2(tsc_h2 *h2, tsc_noise *noise, tsc_stream *stream)
     setup(noise, stream, 2);
     frame(4, 0, 0, NULL, 0);
     CHECK(tsc_h2_start(h2, noise) == TSC_OK);
+}
+
+typedef struct { size_t count, calls; int reject; } map_sink;
+static int stream_map(void *user, const void *bytes, size_t length)
+{
+    map_sink *s = user;
+    const uint8_t *p = bytes;
+    if (s->reject) return TSC_ERR_SPACE;
+    for (size_t i = 0; i < length; ++i) CHECK(p[i] == (uint8_t)(s->count + i));
+    s->count += length;
+    ++s->calls;
+    return TSC_OK;
 }
 
 static void test_h2(void)
@@ -263,6 +280,33 @@ static void test_h2(void)
                        response, sizeof(response), &length, &status) == TSC_OK);
     CHECK(h2.stream_open && h2.active_stream == 3 && status == 200 && length == 6);
     CHECK(!memcmp(response, "\2\0\0\0{}", 6));
+
+    /* Streaming sink: split prefix, multiple DATA frames, full-size Noise
+     * receive records, first-map boundary and bounded delivery chunks. */
+    start_h2(&h2, &noise, &stream);
+    frame(1, 4, 1, &status200, 1);
+    const uint8_t prefix[] = {0x88, 0x13, 0, 0}; /* 5000 payload bytes */
+    frame(0, 0, 1, prefix, 1);
+    frame(0, 0, 1, prefix + 1, 3);
+    for (i = 0; i < 5000; ++i) body[i] = (uint8_t)i;
+    frame(0, 0, 1, body, 3001);
+    memcpy(body + 5000, "\2\0\0\0{}", 6);
+    frame(0, 0, 1, body + 3001, 2005);
+    map_sink sink = {0};
+    CHECK(tsc_h2_post_map_stream(&h2, "localhost", "/machine/map", "{}", 2,
+        5000, stream_map, &sink, &status) == TSC_OK);
+    CHECK(status == 200 && h2.stream_open && sink.count == 5000 && sink.calls >= 20);
+    start_h2(&h2, &noise, &stream);
+    frame(1, 4, 1, &status200, 1);
+    frame(0, 0, 1, prefix, 4);
+    CHECK(tsc_h2_post_map_stream(&h2, "localhost", "/machine/map", NULL, 0,
+        4999, stream_map, &sink, &status) == TSC_ERR_SPACE);
+    start_h2(&h2, &noise, &stream);
+    frame(1, 4, 1, &status200, 1);
+    frame(0, 0, 1, "\1\0\0\0x", 5);
+    sink.reject = 1;
+    CHECK(tsc_h2_post_map_stream(&h2, "localhost", "/machine/map", NULL, 0,
+        5000, stream_map, &sink, &status) == TSC_ERR_SPACE);
 
     start_h2(&h2, &noise, &stream);
     frame(1, 4, 1, &status200, 1);

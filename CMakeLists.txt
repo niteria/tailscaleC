@@ -12,6 +12,13 @@ endif()
 option(TSC_BUILD_EXAMPLES "Build embedding examples" ${TSC_STANDALONE})
 option(TSC_BUILD_TESTS "Build library tests" ${TSC_STANDALONE})
 option(TSC_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
+set(TSC_MBEDTLS_ROOT "" CACHE PATH "Optional mbedTLS 2.28 source tree for the portable provider")
+set(TSC_MBEDTLS_CONFIG "" CACHE FILEPATH "Configuration for the mbedTLS provider")
+if(TSC_MBEDTLS_ROOT)
+    set(TSC_PROVIDER mbedtls)
+else()
+    set(TSC_PROVIDER posix)
+endif()
 
 if(NOT UNIX)
     message(FATAL_ERROR "This build uses the POSIX adapter. Use ESP-IDF for ESP32.")
@@ -26,11 +33,11 @@ set(TSC_NEEDS_CRYPTO OFF)
 set(TSC_NEEDS_STREAM OFF)
 if(TSC_CLIENT OR TSC_DISCO OR TSC_DERP OR TSC_TLS)
     set(TSC_NEEDS_CRYPTO ON)
-    list(APPEND TSC_SOURCES platform/posix/crypto.c)
+    list(APPEND TSC_SOURCES platform/${TSC_PROVIDER}/crypto.c)
 endif()
 if(TSC_CLIENT OR TSC_TLS)
     set(TSC_NEEDS_STREAM ON)
-    list(APPEND TSC_SOURCES platform/posix/stream.c)
+    list(APPEND TSC_SOURCES platform/${TSC_PROVIDER}/stream.c)
 endif()
 add_library(tailscalec STATIC ${TSC_SOURCES})
 add_library(tailscalec::tailscalec ALIAS tailscalec)
@@ -40,13 +47,28 @@ target_include_directories(tailscalec PUBLIC
 target_include_directories(tailscalec PRIVATE ${TSC_PRIVATE_INCLUDES})
 include(cmake/config.cmake)
 tsc_configure_target(tailscalec)
-if(TSC_NEEDS_CRYPTO)
+if(TSC_NEEDS_CRYPTO AND TSC_MBEDTLS_ROOT)
+    file(GLOB mbedtls_sources CONFIGURE_DEPENDS "${TSC_MBEDTLS_ROOT}/library/*.c")
+    add_library(tailscalec_mbedtls STATIC ${mbedtls_sources})
+    target_include_directories(tailscalec_mbedtls PUBLIC "${TSC_MBEDTLS_ROOT}/include"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
+    target_compile_definitions(tailscalec_mbedtls PUBLIC
+        "TSC_CONFIG_HEADER=\"${TSC_CONFIG_HEADER}\""
+        "MBEDTLS_CONFIG_FILE=\"${TSC_MBEDTLS_CONFIG}\"")
+    target_link_libraries(tailscalec PUBLIC tailscalec_mbedtls)
+    if(TSC_SANITIZERS)
+        target_compile_options(tailscalec_mbedtls PRIVATE -fsanitize=address,undefined
+            -fno-omit-frame-pointer)
+    endif()
+elseif(TSC_NEEDS_CRYPTO)
     find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
     target_link_libraries(tailscalec PUBLIC OpenSSL::Crypto)
 endif()
 
 # Install the exact configuration used to compile this archive. A consumer of
 # this package must not silently select a different public structure layout.
+# The source-tree mbedTLS provider shares the embedding firmware's config.
+if(NOT TSC_MBEDTLS_ROOT)
 include(CMakePackageConfigHelpers)
 get_target_property(TSC_BUILT_CONFIG tailscalec TSC_CONFIG_HEADER)
 configure_file("${TSC_BUILT_CONFIG}"
@@ -67,7 +89,7 @@ install(EXPORT tailscalecTargets NAMESPACE tailscalec::
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tailscalecConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/tailscalecConfigVersion.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tailscalec")
-install(FILES LICENSE THIRD_PARTY_NOTICES.md
+install(FILES LICENSE CREDITS.md THIRD_PARTY_NOTICES.md
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tailscalec")
 install(FILES third_party/wireguard/LICENSE third_party/wireguard/LICENSE.RFC7693
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tailscalec/wireguard")
@@ -75,7 +97,8 @@ install(FILES src/discovery/LICENSE.tailtiny
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tailscalec")
 install(FILES src/tcp/lwip/LICENSE
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tailscalec/lwip")
-if(TSC_TLS)
+endif()
+if(TSC_TLS AND NOT TSC_MBEDTLS_ROOT)
     find_package(OpenSSL 3.0 REQUIRED COMPONENTS SSL)
     target_link_libraries(tailscalec PUBLIC OpenSSL::SSL)
 endif()
@@ -110,6 +133,9 @@ endif()
 
 if(TSC_BUILD_TESTS)
     include(CTest)
+    if(TSC_TLS AND TSC_MBEDTLS_ROOT)
+        find_package(OpenSSL 3.0 REQUIRED COMPONENTS SSL Crypto)
+    endif()
     set(test_modules transport stun)
     if(TSC_NEEDS_CRYPTO)
         list(APPEND test_modules crypto)
@@ -119,7 +145,7 @@ if(TSC_BUILD_TESTS)
     endif()
     if(TSC_CLIENT)
         list(APPEND test_modules packet policy wireguard control_json
-            control_map control_protocol control_time control_live client)
+            control_map control_project control_protocol control_time control_live client session_cache)
     endif()
     if(TSC_DISCO OR TSC_DERP)
         list(APPEND test_modules nacl)
@@ -137,6 +163,9 @@ if(TSC_BUILD_TESTS)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${module}.c")
             add_executable(test-${module} "tests/test_${module}.c")
             target_link_libraries(test-${module} PRIVATE tailscalec::tailscalec)
+            if(module STREQUAL "stream" AND TSC_TLS AND TSC_MBEDTLS_ROOT)
+                target_link_libraries(test-${module} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            endif()
             target_include_directories(test-${module} PRIVATE ${TSC_PRIVATE_INCLUDES})
             target_compile_options(test-${module} PRIVATE
                 -Wall -Wextra -Wpedantic -Werror -UNDEBUG)

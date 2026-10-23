@@ -207,7 +207,7 @@ static void capacities_and_failures(void) {
     CHECK(tsc_disco_probe(&a.disco,b.node,0)==TSC_ERR_SPACE);
     a.now+=5000;
     CHECK(tsc_disco_probe(&a.disco,b.node,0)==TSC_OK);
-    for (size_t i=1;i<TSC_MAX_PEERS;++i) {
+    for (size_t i=1;i<TSC_CLIENT_PEER_SLOTS;++i) {
         uint8_t priv[32]={0},pub[32],node[32]={0};
         priv[1]=(uint8_t)(i+40); node[0]=(uint8_t)(i+1);
         CHECK(tsc_crypto_x25519_public(pub,priv)==TSC_OK);
@@ -218,9 +218,9 @@ static void capacities_and_failures(void) {
     CHECK(tsc_disco_set_peer(&a.disco,node,pub,NULL,0)==TSC_ERR_SPACE);
 }
 static void quota_one(void) {
-#if TSC_DISCO_MAX_PROBES == TSC_MAX_PEERS
+#if TSC_DISCO_MAX_PROBES == TSC_CLIENT_PEER_SLOTS
     fixture();
-    for (size_t i=1;i<TSC_MAX_PEERS;++i) {
+    for (size_t i=1;i<TSC_CLIENT_PEER_SLOTS;++i) {
         uint8_t priv[32]={0},pub[32],node[32]={0};
         priv[1]=(uint8_t)(i+90); node[0]=(uint8_t)(i+10);
         CHECK(tsc_crypto_x25519_public(pub,priv)==TSC_OK);

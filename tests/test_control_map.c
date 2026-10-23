@@ -19,11 +19,44 @@
   "32\",\"Ports\":{\"First\":32123,\"Last\":32123}}],\"IPProto\":[17]}]"
 static control_impl c;
 static void reset(void) {
+#if TSC_CONTROL_DYNAMIC_PEERS
+  map_storage_clear(&c);
+#endif
   memset(&c, 0, sizeof(c));
   memset(c.node_public, 0x11, 32);
 }
-static int decode(const char *json) {
+static int decode_allocated(const char *json) {
+#if TSC_CONTROL_PROJECT_MAP
+  tsc_json_project p;
+  char projected[TSC_CONTROL_RESPONSE_SIZE + 1];
+  tsc_json_project_init(&p, projected, sizeof(projected));
+#if TSC_CONTROL_DYNAMIC_PEERS
+  stream_begin(&c);
+  p.peer_handler = projected_peer;
+  p.peer_user = &c;
+#endif
+  for (size_t i = 0; i < strlen(json); ++i) {
+    int r = tsc_json_project_feed(&p, json + i, 1);
+    if (r) return fail(&c, r, "projection failed");
+  }
+  int r = tsc_json_project_finish(&p);
+  if (r) return fail(&c, r, "projection incomplete");
+  return parse_map(&c, projected, p.used);
+#else
   return parse_map(&c, json, strlen(json));
+#endif
+}
+static int decode(const char *json) {
+  assert(scratch_open(&c) == TSC_OK);
+  int r = decode_allocated(json);
+#if TSC_CONTROL_DYNAMIC_PEERS
+  stream_cleanup(&c);
+#endif
+  scratch_close(&c);
+#if TSC_CONTROL_DYNAMIC_SCRATCH
+  assert(!c.scratch && !c.tokens && !c.request && !c.response);
+#endif
+  return r;
 }
 
 static void valid_maps(void) {
@@ -181,6 +214,20 @@ static void addresses_and_url(void) {
   assert(url(&c, "https://user:pass@host") < 0);
   assert(url(&c, "https://example.org/path") < 0);
   assert(url(&c, "https://example.org:99999999999999999999999") < 0);
+  reset();
+  tsc_control handle = {&c};
+  tsc_endpoint endpoints[2] = {{.family=TSC_AF_IPV4,.address={192,168,1,5},.port=41641},
+                               {.family=TSC_AF_IPV4,.address={203,0,113,5},.port=12345}};
+  uint8_t types[2] = {1,2};
+  assert(tsc_control_set_endpoints_typed(&handle, endpoints, types, 2) == TSC_OK);
+  assert(scratch_open(&c) == TSC_OK);
+  size_t request_length;
+  assert(build_map_request(&c, 0, &request_length) == TSC_OK);
+  assert(strstr(c.request, "\"EndpointTypes\":[1,2]"));
+  types[1] = 6;
+  assert(tsc_control_set_endpoints_typed(&handle, endpoints, types, 2) == TSC_ERR_ARGUMENT);
+  assert(c.endpoint_types[1] == 2);
+  scratch_close(&c);
 }
 
 static uint64_t fake_now;
@@ -270,12 +317,61 @@ static void expiry_and_maintenance(void) {
   reset_clock(UINT64_MAX - 5, UINT64_MAX - 5);
   assert(decode("{" SELF_EXPIRY "," CONTROL_TIME "}") == TSC_ERR_PROTOCOL);
 }
+static void peer_directory(void) {
+#if TSC_CONTROL_DYNAMIC_PEERS
+  /* Every peer is retained, independently of hostname, order or activity. */
+  const unsigned peers = TSC_MAX_PEERS < 40 ? TSC_MAX_PEERS : 40;
+  for (unsigned variant = 0; variant < 2; ++variant) {
+    char json[16000];
+    size_t at = (size_t)snprintf(json, sizeof(json), "{" SELF ",\"%s\":[",
+                                variant == 0 ? "Peers" : "PeersChanged");
+    for (unsigned i = 1; i <= peers; ++i) {
+      int n = snprintf(json + at, sizeof(json) - at,
+          "%s{\"ID\":%u,\"Key\":\"nodekey:%064x\",\"Addresses\":[\"100.64.1.%u/32\"],"
+          "\"Hostinfo\":{\"Unused\":[0,1,2,3,4,5,6,7,8,9]}}", i > 1 ? "," : "", i + 1, i + 1, i);
+      assert(n > 0 && (size_t)n < sizeof(json) - at);
+      at += (size_t)n;
+    }
+    strcpy(json + at, "],\"PacketFilter\":" ALLOW "}");
+    assert(peers < 20 || strlen(json) > TSC_CONTROL_RESPONSE_SIZE);
+    reset();
+    assert(decode(json) == TSC_OK);
+    assert(c.map.peer_count == peers && c.map.peer_capacity <= TSC_MAX_PEERS);
+    for (unsigned i = 0; i < peers; ++i) {
+      assert(c.map.peers[i].ipv4[3] == i + 1 && c.map.peers[i].id == i + 2);
+      assert(!tsc_policy_allows(&c.map.policy, 4, c.map.peers[i].ipv4,
+                               c.map.ipv4, 17, 32123));
+    }
+  }
+  reset();
+  assert(decode("{" SELF ",\"PeersChanged\":[{}],\"Peers\":[" PEER "]}") == TSC_OK);
+  assert(c.map.peer_count == 1);
+  assert(decode("{" SELF ",\"Peers\":[],\"Peers\":[" PEER "]}") == TSC_OK);
+  assert(c.map.peer_count == 0);
+  assert(decode("{" SELF ",\"Peers\":null,\"Peers\":[{}],\"PeersChanged\":[" PEER "]}") == TSC_OK);
+  assert(c.map.peer_count == 1);
+  assert(decode("{" SELF ",\"Peers\":[{\"ID\":2,\"Key\":\"nodekey:" KEY2
+      "\",\"Addresses\":[\"100.64.0.20/32\"],\"Endpoints\":["
+      "\"10.0.0.1:1234\",\"10.1.0.1:1234\",\"10.2.0.1:1234\",\"10.3.0.1:1234\","
+      "\"10.4.0.1:1234\",\"203.0.113.1:1234\"]}]}") == TSC_OK);
+  assert(c.map.peers[0].endpoint_count == TSC_CONTROL_MAX_ENDPOINTS);
+  int public_candidate = 0;
+  for (size_t i = 0; i < c.map.peers[0].endpoint_count; ++i) {
+    tsc_endpoint ep = tsc_control_endpoint_load(&c.map.peers[0].endpoints[i]);
+    if (ep.address[0] == 203) public_candidate = 1;
+  }
+  assert(public_candidate);
+  reset();
+#endif
+}
 int main(void) {
   valid_maps();
   fail_closed();
   tailscale_relays();
   addresses_and_url();
   expiry_and_maintenance();
+  peer_directory();
+  reset();
   puts("control map tests passed");
   return 0;
 }

@@ -16,14 +16,20 @@ typedef enum {
     TSC_JSON_NULL
 } tsc_json_type;
 
+#if TSC_CONTROL_COMPACT_JSON
+typedef uint16_t tsc_json_index;
+#define TSC_JSON_NONE UINT16_MAX
+#else
+typedef uint32_t tsc_json_index;
 #define TSC_JSON_NONE UINT32_MAX
+#endif
 
 typedef struct {
-    tsc_json_type type;
-    uint32_t start;  /* Inclusive input offset; strings exclude their quotes. */
-    uint32_t end;    /* Exclusive input offset. */
-    uint32_t parent; /* Immediate enclosing object/array, or TSC_JSON_NONE. */
-    uint32_t next;   /* Index immediately following this entire subtree. */
+    tsc_json_index type;
+    tsc_json_index start;  /* Inclusive input offset; strings exclude quotes. */
+    tsc_json_index end;    /* Exclusive input offset. */
+    tsc_json_index parent; /* Enclosing object/array, or TSC_JSON_NONE. */
+    tsc_json_index next;   /* Index immediately following this subtree. */
 } tsc_json_token;
 
 /* Accept exactly one JSON value plus optional JSON whitespace. UTF-8 and UTF-16

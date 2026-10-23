@@ -25,6 +25,15 @@ int main(void)
 #if TSC_ENABLE_CLIENT
     printf("client (includes WireGuard peers and packet buffers): %zu\n", sizeof(tsc_client));
     printf("control context (one separate allocation): %zu\n", tsc_control_memory_size());
+    printf("temporary control scratch during join/refresh: %zu\n", tsc_control_scratch_size());
+#if TSC_CONTROL_DYNAMIC_PEERS
+    printf("dynamic directory: %zu bytes per peer, capacity limit %u (allocated as needed)\n",
+           sizeof(tsc_control_peer), (unsigned)TSC_MAX_PEERS);
+#endif
+#if TSC_SESSION_CACHE
+    printf("authenticated session cache: %u slots, plus one probationary slot; replay/discovery history allocated per known peer\n",
+           (unsigned)TSC_MAX_SESSIONS);
+#endif
     printf("WireGuard device: %zu; each peer: %zu (already in client)\n",
            sizeof(tsc_wg), sizeof(tsc_wg_peer));
     printf("policy: %zu (already in each control map)\n", sizeof(tsc_policy));

@@ -40,7 +40,7 @@ static void validate(const char *text, size_t length,
             size_t decoded_length;
             CHECK(tsc_json_string_copy(text, token, decoded, sizeof(decoded),
                                         &decoded_length) == TSC_OK);
-            CHECK(decoded_length <= token->end - token->start);
+            CHECK(decoded_length <= (size_t)(token->end - token->start));
             CHECK(decoded[decoded_length] == '\0');
         } else if (token->type == TSC_JSON_ARRAY || token->type == TSC_JSON_OBJECT) {
             CHECK(token->end > token->start);

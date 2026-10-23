@@ -420,13 +420,15 @@ static int rule(policy_reader *r, tsc_policy_rule *out)
     return TSC_ERR_PROTOCOL;
 }
 
-int tsc_policy_parse_json(tsc_policy *policy, const uint8_t *json, size_t length)
+int tsc_policy_append_json(tsc_policy *policy, const uint8_t *json, size_t length)
 {
     policy_reader reader;
     int result = TSC_OK;
     if (!policy) return TSC_ERR_ARGUMENT;
-    memset(policy, 0, sizeof(*policy));
-    if (!json) return TSC_ERR_ARGUMENT;
+    if (!json || policy->rule_count > TSC_MAX_FILTER_RULES) {
+        memset(policy, 0, sizeof(*policy));
+        return TSC_ERR_ARGUMENT;
+    }
     reader.data = json;
     reader.length = length;
     reader.position = 0;
@@ -438,6 +440,8 @@ int tsc_policy_parse_json(tsc_policy *policy, const uint8_t *json, size_t length
                     result = TSC_ERR_SPACE;
                     break;
                 }
+                memset(&policy->rules[policy->rule_count], 0,
+                       sizeof(policy->rules[policy->rule_count]));
                 result = rule(&reader, &policy->rules[policy->rule_count]);
                 if (result != TSC_OK) break;
                 policy->rule_count++;
@@ -453,6 +457,13 @@ int tsc_policy_parse_json(tsc_policy *policy, const uint8_t *json, size_t length
     if (result == TSC_OK && reader.position != length) result = TSC_ERR_PROTOCOL;
     if (result != TSC_OK) memset(policy, 0, sizeof(*policy));
     return result;
+}
+
+int tsc_policy_parse_json(tsc_policy *policy, const uint8_t *json, size_t length)
+{
+    if (!policy) return TSC_ERR_ARGUMENT;
+    memset(policy, 0, sizeof(*policy));
+    return tsc_policy_append_json(policy, json, length);
 }
 
 static int prefix_matches(const tsc_policy_prefix *p, unsigned family,

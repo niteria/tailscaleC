@@ -58,6 +58,7 @@ typedef struct {
     tsc_client_relay_send_fn relay_send;
     void *relay_user;
     uint16_t preferred_derp;
+    const uint8_t *endpoint_types; /* Copied at init; Local=1, STUN=2. */
 } tsc_client_config;
 
 #ifndef TSC_MAX_FLOWS
@@ -78,6 +79,7 @@ typedef struct {
     uint8_t public_key[32], ipv4[4];
     tsc_endpoint endpoint;
     uint64_t endpoint_millis;
+    uint64_t last_used_ms;
     tsc_endpoint candidates[TSC_CONTROL_MAX_ENDPOINTS];
     size_t candidate_count;
 } tsc_client_peer;
@@ -95,9 +97,18 @@ struct tsc_client {
     int (*tai64n_now)(void *, uint8_t[12]);
     void *clock_user;
     tsc_wg wireguard;
-    tsc_wg_peer wg_peers[TSC_MAX_PEERS];
-    tsc_client_peer peers[TSC_MAX_PEERS];
+    tsc_wg_peer wg_peers[TSC_CLIENT_PEER_SLOTS];
+    tsc_client_peer peers[TSC_CLIENT_PEER_SLOTS];
+#if TSC_SESSION_CACHE
+    struct tsc_peer_history *history;
+    size_t history_count;
+    size_t sweep_cursor;
+    uint64_t next_sweep_ms;
+    uint8_t sweep_key[32];
+    unsigned probe_generation;
+#endif
     tsc_endpoint endpoints[TSC_CONTROL_MAX_ENDPOINTS];
+    uint8_t endpoint_types[TSC_CONTROL_MAX_ENDPOINTS];
     size_t endpoint_count;
 #if TSC_ENABLE_DISCO
     tsc_disco disco;
@@ -137,7 +148,9 @@ int tsc_client_maintain(tsc_client *client, uint32_t max_age_ms);
 /* Replace advertised UNDERLYING addresses after DHCP/STUN changes. No network
  * I/O occurs here; the next refresh_map publishes them to the coordinator. */
 int tsc_client_set_endpoints(tsc_client *client, const tsc_endpoint *endpoints,
-                              size_t count);
+                               size_t count);
+int tsc_client_set_endpoints_typed(tsc_client *client, const tsc_endpoint *endpoints,
+                                  const uint8_t *types, size_t count);
 void tsc_client_close(tsc_client *client);
 int tsc_client_address(const tsc_client *client, tsc_endpoint *address);
 const char *tsc_client_last_error(const tsc_client *client);

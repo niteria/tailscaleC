@@ -11,6 +11,14 @@ capacities bound protocol storage. This is a new implementation with substantial
 automated testing, not an independently audited replacement for the full
 Tailscale client.
 
+## Credits
+
+The original version was provided by **Eryk Wieliczko
+([@erykwieliczko](https://github.com/erykwieliczko))** to Bartosz Nitka
+([@niteria](https://github.com/niteria)) as **public domain**. Thank you, Eryk!
+See [credits and provenance](CREDITS.md) for the source import and subsequent
+development.
+
 ## Configure the library
 
 Select a header when configuring CMake, or edit [`config.h`](config.h):
@@ -42,6 +50,7 @@ application advertises an underlying UDP endpoint reachable by its peers.
 | [`profiles/full.h`](profiles/full.h) | Client, application UDP/TCP, TLS, DISCO, DERP, STUN, outer IPv6 |
 | [`profiles/client_lan.h`](profiles/client_lan.h) | Client, application UDP, TLS, DISCO, direct IPv4 paths |
 | [`profiles/embedded_udp.h`](profiles/embedded_udp.h) | LAN UDP client with 2 peers, smaller policy/map bounds and no application TCP |
+| [`profiles/openbeken.h`](profiles/openbeken.h) | IPv4 native-stack port: streamed dynamic peer directory, bounded authenticated-session cache, compact endpoint storage |
 | [`profiles/client_plain.h`](profiles/client_plain.h) | Small direct UDP client with Noise; no TLS, DISCO, STUN or DERP |
 | [`profiles/tcp_only.h`](profiles/tcp_only.h) | Small IPv4 client with application TCP and TLS; application UDP/DISCO/STUN/DERP excluded |
 | [`profiles/ipv4.h`](profiles/ipv4.h) | Underlying UDP adapter and IPv4 STUN; no tailnet client |
@@ -251,11 +260,13 @@ several packet buffers and per-peer WireGuard/discovery state, and the TCP
 engine uses fixed pools and bounded connection buffers. Reducing peers, policy
 rules, endpoints, ports and queue sizes changes real storage costs.
 
-The control client allocates one fixed-size context, reported by
-`tsc_control_memory_size()`. It retains bounded response bytes, JSON tokens,
-Noise record buffers and current/staging maps. It does **not** yet stream JSON
-directly into the final peer table. Oversized maps, policies and frames return
-defined errors rather than silently truncating access rules. OS sockets, TLS,
+The control client's context size is reported by `tsc_control_memory_size()`.
+The full profile retains bounded response bytes, JSON tokens, Noise record
+buffers and current/staging maps. The small-memory OpenBeken profile streams
+peer records into a dynamically sized, bounded directory, reuses one decoded
+map and allocates temporary coordination scratch only during join/refresh.
+Oversized maps, policies and frames return defined errors rather than silently
+truncating access rules. Directory/history storage, scratch, OS sockets, TLS,
 crypto providers and resolver calls have additional allocation/stack costs;
 compile-time limits are not a complete firmware RAM guarantee.
 
@@ -312,6 +323,7 @@ See [architecture](docs/architecture.md),
 test boundaries. Automated tests and bounded fuzz campaigns do not replace a
 security audit.
 
-Original code is [MIT licensed](LICENSE). Vendored code and derived protocol
-components retain their upstream notices; see
-[third-party notices](THIRD_PARTY_NOTICES.md).
+Eryk's original contribution was supplied as public domain; see
+[credits and provenance](CREDITS.md). Subsequent original contributions are
+[MIT licensed](LICENSE). Vendored code and derived protocol components retain
+their upstream notices; see [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -3,6 +3,7 @@
  * A test CA can be supplied as TSC_TEST_CA_PEM (PEM contents). */
 #include "tailscalec/control.h"
 #include "tailscalec/crypto.h"
+#include "../platform/system.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,8 @@ int main(void) {
     if (!url || !auth) return 77;
     tsc_control control = {0};
     tsc_control_config config = {0};
+    tsc_platform platform = {.monotonic_ms = tsc_system_monotonic_ms};
+    config.platform = &platform;
     config.url = url; config.auth_key = auth;
     config.hostname = "tailscalec-control-test";
     config.ca_pem = getenv("TSC_TEST_CA_PEM");
